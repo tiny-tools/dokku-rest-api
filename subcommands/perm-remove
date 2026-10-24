@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+# $1 is "api:<command>"; the command name is this file's name.
+exec "$(dirname "$0")/../bin/dokku-api" cli "$(basename "$0")" "${@:2}"

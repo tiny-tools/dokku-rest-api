@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Dokku trigger: uninstall PLUGIN_NAME. Keeps the database in /var/lib/dokku/data/api.
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+plugin-uninstall() {
+  declare PLUGIN="$1"
+  [[ "$PLUGIN" == "$(basename "$(dirname "$(readlink -f "$0")")")" ]] || return 0
+
+  if command -v systemctl >/dev/null && [[ -f /etc/systemd/system/dokku-api.service ]]; then
+    systemctl disable --now dokku-api.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/dokku-api.service
+    systemctl daemon-reload
+  fi
+  rm -f /etc/nginx/conf.d/dokku-api.conf /var/lib/dokku/data/api/nginx/*.conf
+  if command -v nginx >/dev/null && nginx -t >/dev/null 2>&1; then
+    systemctl reload nginx 2>/dev/null || true
+  fi
+  dokku_log_info1 "Removed dokku-api service and nginx config; data kept in /var/lib/dokku/data/api"
+}
+
+plugin-uninstall "$@"

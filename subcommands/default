@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+exec "$(dirname "$0")/../bin/dokku-api" cli help

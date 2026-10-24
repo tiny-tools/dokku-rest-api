@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+[[ " help api:help " == *" $1 "* ]] || exit "$DOKKU_NOT_IMPLEMENTED_EXIT"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+case "$1" in
+  help)
+    echo "    api, Manage the Dokku REST API (tokens, permissions, CLI allow-list)"
+    ;;
+  api:help)
+    exec "$(dirname "$(readlink -f "$0")")/bin/dokku-api" cli help
+    ;;
+esac

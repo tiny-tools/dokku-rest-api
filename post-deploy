@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Dokku trigger: post-deploy APP INTERNAL_PORT INTERNAL_IP_ADDRESS IMAGE_TAG
+# Sends the optional webhook configured with `dokku api:set webhook-url <url>`.
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+"$(dirname "$(readlink -f "$0")")/bin/dokku-api" webhook "$1" "$4" || true

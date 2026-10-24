@@ -1,0 +1,20 @@
+{
+  "name": "dokku-rest-api",
+  "version": "0.1.0",
+  "description": "Dokku plugin exposing a token-scoped REST API and an allow-listed 1:1 CLI bridge, plus a GitHub Action",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --disable-warning=ExperimentalWarning --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,65 @@
+name: Dokku REST API
+description: Deploy, scale, restart and configure Dokku apps through the dokku-api plugin, without SSH keys
+author: tiny-tools
+branding:
+  icon: upload-cloud
+  color: blue
+
+inputs:
+  dokku_url:
+    description: Base URL of the API, e.g. https://api.dokku.example.com
+    required: true
+  api_token:
+    description: API token created with `dokku api:token-create` (store it as a secret)
+    required: true
+  app_name:
+    description: Target app
+    required: false
+  config:
+    description: Environment variables to set, one KEY=value per line
+    required: false
+  config_restart:
+    description: Restart the app after setting config (skipped automatically when a deploy follows)
+    required: false
+    default: "true"
+  deploy_image:
+    description: Docker image to deploy (uses git:from-image)
+    required: false
+  deploy_repository:
+    description: Git repository (https:// or git@) to sync and build (uses git:sync --build)
+    required: false
+  deploy_ref:
+    description: Branch, tag or commit for deploy_repository
+    required: false
+  rebuild:
+    description: Rebuild and redeploy the current app source (ps:rebuild)
+    required: false
+    default: "false"
+  scale:
+    description: Process formation, e.g. "web=2 worker=1"
+    required: false
+  restart:
+    description: Restart the app
+    required: false
+    default: "false"
+  cli_commands:
+    description: >
+      Allow-listed dokku commands, one JSON array per line, e.g. ["ps:scale", "web=2"].
+      The app from app_name is inserted automatically. A JSON object line is sent as-is to POST /api/v1/cli.
+    required: false
+  timeout_seconds:
+    description: HTTP timeout per request
+    required: false
+    default: "900"
+
+outputs:
+  results:
+    description: JSON array with the result of every step
+  status:
+    description: App status JSON (only when no action input was given)
+  stdout:
+    description: stdout of the last cli_commands entry
+
+runs:
+  using: node24
+  main: dist/action/main.js

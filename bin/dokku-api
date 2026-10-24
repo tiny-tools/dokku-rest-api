@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Launches one of the compiled entrypoints in dist/: daemon, cli, webhook.
+set -eo pipefail
+PLUGIN_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+
+if [[ -r /etc/default/dokku-api ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source /etc/default/dokku-api
+  set +a
+fi
+
+NODE_BIN="${DOKKU_API_NODE:-$(command -v node || true)}"
+if [[ -z "$NODE_BIN" ]] || [[ ! -x "$NODE_BIN" ]]; then
+  echo " !     Node.js >= 22.13 is required by the api plugin but was not found" >&2
+  exit 1
+fi
+
+umask 027
+exec "$NODE_BIN" --disable-warning=ExperimentalWarning "$PLUGIN_DIR/dist/$1.js" "${@:2}"

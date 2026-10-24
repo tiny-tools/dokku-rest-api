@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Dokku trigger: runs as root on `dokku plugin:install`.
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+PLUGIN_DIR="$(dirname "$(readlink -f "$0")")"
+DATA_DIR="/var/lib/dokku/data/api"
+ENV_FILE="/etc/default/dokku-api"
+UNIT_FILE="/etc/systemd/system/dokku-api.service"
+NGINX_INCLUDE="/etc/nginx/conf.d/dokku-api.conf"
+SYSTEM_USER="${DOKKU_SYSTEM_USER:-dokku}"
+SYSTEM_GROUP="${DOKKU_SYSTEM_GROUP:-dokku}"
+
+plugin-install() {
+  if [[ "$(basename "$PLUGIN_DIR")" != "api" ]]; then
+    dokku_log_warn "This plugin should be installed with '--name api' so its commands are available as 'dokku api:*'"
+  fi
+
+  local node_bin
+  node_bin="$(command -v node || true)"
+  if [[ -z "$node_bin" ]]; then
+    dokku_log_fail "Node.js >= 22.13 is required. Install it first, e.g. via https://github.com/nodesource/distributions"
+  fi
+  if ! "$node_bin" -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit(a>22||(a===22&&b>=13)?0:1)'; then
+    dokku_log_fail "Node.js >= 22.13 is required (found $("$node_bin" --version))"
+  fi
+
+  mkdir -p "$DATA_DIR/nginx" "$DATA_DIR/acme"
+  chown -R "$SYSTEM_USER:$SYSTEM_GROUP" "$DATA_DIR"
+  # nginx (www-data) must traverse into acme/ for certificate challenges; nothing else is world-readable.
+  chmod 711 "$DATA_DIR"
+  chmod 755 "$DATA_DIR/acme"
+  chmod 750 "$DATA_DIR/nginx"
+
+  if [[ ! -f "$ENV_FILE" ]]; then
+    cat >"$ENV_FILE" <<ENV
+# Settings for the Dokku REST API daemon (dokku-api.service)
+DOKKU_API_HOST=127.0.0.1
+DOKKU_API_PORT=5099
+DOKKU_API_DB=$DATA_DIR/storage.db
+DOKKU_API_NODE=$node_bin
+# Upper bound for a single dokku command (deploys can be slow)
+DOKKU_API_EXEC_TIMEOUT_MS=900000
+ENV
+    chmod 644 "$ENV_FILE"
+  fi
+
+  sudo -u "$SYSTEM_USER" -H "$PLUGIN_DIR/bin/dokku-api" cli migrate
+
+  if [[ -d /etc/nginx/conf.d ]]; then
+    echo "include $DATA_DIR/nginx/*.conf;" >"$NGINX_INCLUDE"
+  fi
+
+  if command -v systemctl >/dev/null && [[ -d /run/systemd/system ]]; then
+    cat >"$UNIT_FILE" <<UNIT
+[Unit]
+Description=Dokku REST API
+After=network.target docker.service
+
+[Service]
+Type=simple
+User=$SYSTEM_USER
+Group=$SYSTEM_GROUP
+EnvironmentFile=-$ENV_FILE
+ExecStart=$PLUGIN_DIR/bin/dokku-api daemon
+Restart=on-failure
+RestartSec=2
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+    systemctl enable dokku-api.service >/dev/null 2>&1
+    systemctl restart dokku-api.service
+    dokku_log_info1 "dokku-api.service (re)started on $(grep -E '^DOKKU_API_(HOST|PORT)=' "$ENV_FILE" | cut -d= -f2 | paste -sd:)"
+  else
+    dokku_log_warn "systemd not found; start the daemon yourself: sudo -u $SYSTEM_USER $PLUGIN_DIR/bin/dokku-api daemon"
+  fi
+
+  dokku_log_info2 "Next: dokku api:setup --domain api.example.com && dokku api:token-create <name> --app <app> --scope readonly"
+}
+
+plugin-install "$@"
