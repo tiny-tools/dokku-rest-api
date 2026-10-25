@@ -44,3 +44,41 @@ test("requestIdToken asks GitHub for the audience", async () => {
     server.close();
   }
 });
+
+test("withRetries retries dokku and server failures only", async () => {
+  const { ApiError, withRetries } = await import("../dist/action/lib.js");
+  const sleeps = [];
+  const sleep = async (ms) => void sleeps.push(ms);
+  const failing = (errors) => {
+    let calls = 0;
+    const fn = async () => {
+      calls++;
+      if (errors.length) throw errors.shift();
+      return "ok";
+    };
+    return { fn, calls: () => calls };
+  };
+
+  const flaky = failing([new ApiError("build broke", {}, 422), new ApiError("bad gateway", {}, 502)]);
+  assert.equal(await withRetries(flaky.fn, 2, 5000, undefined, sleep), "ok");
+  assert.equal(flaky.calls(), 3);
+  assert.deepEqual(sleeps, [5000, 5000]);
+
+  const exhausted = failing([new ApiError("a", {}, 422), new ApiError("b", {}, 422)]);
+  await assert.rejects(withRetries(exhausted.fn, 1, 0, undefined, sleep), /b/);
+  assert.equal(exhausted.calls(), 2);
+
+  for (const err of [new ApiError("forbidden", {}, 403), new ApiError("bad", {}, 400), Object.assign(new Error("t"), { name: "TimeoutError" })]) {
+    const once = failing([err]);
+    await assert.rejects(withRetries(once.fn, 3, 0, undefined, sleep));
+    assert.equal(once.calls(), 1, err.message);
+  }
+
+  const network = failing([new TypeError("fetch failed")]);
+  assert.equal(await withRetries(network.fn, 1, 0, undefined, sleep), "ok");
+  assert.equal(network.calls(), 2);
+
+  const none = failing([new ApiError("a", {}, 422)]);
+  await assert.rejects(withRetries(none.fn, 0, 0, undefined, sleep));
+  assert.equal(none.calls(), 1);
+});

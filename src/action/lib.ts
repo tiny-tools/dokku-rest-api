@@ -39,9 +39,46 @@ export class ApiError extends Error {
   constructor(
     message: string,
     readonly body: Record<string, unknown>,
+    readonly status: number,
   ) {
     super(message);
   }
+}
+
+// Worth another attempt: the dokku command failed (422), the server or proxy
+// had a problem (5xx), or the connection broke. Not retried: input and
+// permission errors, and our own timeout, because the build may still be
+// running on the server.
+export function isRetryable(err: unknown): boolean {
+  if (err instanceof ApiError) return err.status === 422 || err.status >= 500;
+  if (err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError")) return false;
+  return err instanceof TypeError; // fetch's network errors
+}
+
+export async function withRetries<T>(
+  attempt: () => Promise<T>,
+  retries: number,
+  delayMs: number,
+  onRetry: (err: unknown, remaining: number) => void = () => {},
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+): Promise<T> {
+  for (let left = retries; ; left--) {
+    try {
+      return await attempt();
+    } catch (err) {
+      if (left <= 0 || !isRetryable(err)) throw err;
+      onRetry(err, left);
+      await sleep(delayMs);
+    }
+  }
+}
+
+function intInput(name: string, fallback: number): number {
+  const raw = input(name);
+  if (raw === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) throw new Error(`input "${name}" must be a whole number of 0 or more`);
+  return value;
 }
 
 // Requests a GitHub Actions OIDC token for `audience`. GitHub only offers
@@ -93,7 +130,7 @@ export class Client {
     }
     if (!res.ok) {
       const detail = [parsed.title, parsed.detail].filter(Boolean).join(": ") || text.slice(0, 500);
-      throw new ApiError(`${method} ${path} failed with HTTP ${res.status}: ${detail}`, parsed);
+      throw new ApiError(`${method} ${path} failed with HTTP ${res.status}: ${detail}`, parsed, res.status);
     }
     return parsed;
   }
@@ -211,8 +248,19 @@ export async function run(): Promise<void> {
   if (deploying) {
     needApp("deploy");
     const body = image ? { image } : repository ? { repository, ...(input("deploy_ref") ? { ref: input("deploy_ref") } : {}) } : {};
+    const retries = intInput("deploy_retries", 0);
+    const delaySeconds = intInput("deploy_retry_delay", 60);
     group(image ? `Deploy image ${image}` : repository ? `Deploy ${repository}` : "Rebuild app");
-    const res = await client.request("POST", `${appPath}/deploys`, body);
+    const res = await withRetries(
+      () => client.request("POST", `${appPath}/deploys`, body),
+      retries,
+      delaySeconds * 1000,
+      (err, left) => {
+        if (err instanceof ApiError) printExecution(err.body as Execution);
+        const message = err instanceof Error ? err.message : String(err);
+        console.log(`::warning::${escapeData(`Deploy failed (${message}); retrying in ${delaySeconds} s, ${left} attempt(s) left.`)}`);
+      },
+    );
     printExecution(res as Execution);
     results.push({ step: "deploy", ...res });
     endGroup();

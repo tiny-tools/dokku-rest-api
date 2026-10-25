@@ -463,6 +463,8 @@ jobs:
 | `deploy_image`      |         | Docker image to deploy (`git:from-image`) |
 | `deploy_repository` |         | git repository to sync and build (`git:sync --build`) |
 | `deploy_ref`        |         | branch, tag or commit for `deploy_repository` |
+| `deploy_retries`    | `0`     | extra deploy attempts after a failure in Dokku (`422`), a `5xx` or a network error; never after `4xx` or a client timeout |
+| `deploy_retry_delay` | `60`   | seconds to wait before each retry |
 | `rebuild`           | `false` | rebuild the current source (`ps:rebuild`) |
 | `scale`             |         | formation, e.g. `web=2 worker=1` |
 | `restart`           | `false` | restart the app |

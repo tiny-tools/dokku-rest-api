@@ -37,6 +37,16 @@ inputs:
   deploy_ref:
     description: Branch, tag or commit for deploy_repository
     required: false
+  deploy_retries:
+    description: >
+      Extra attempts when the deploy fails in Dokku or on the way (HTTP 422, 5xx, network error),
+      e.g. when two builds on one server get in each other's way. Not for 4xx errors or client timeouts.
+    required: false
+    default: "0"
+  deploy_retry_delay:
+    description: Seconds to wait before each deploy retry
+    required: false
+    default: "60"
   rebuild:
     description: Rebuild and redeploy the current app source (ps:rebuild)
     required: false
