@@ -23,3 +23,24 @@ test("parseCliCommands", () => {
   ]);
   assert.throws(() => parseCliCommands("ps:scale web=2", "a"));
 });
+
+test("requestIdToken asks GitHub for the audience", async () => {
+  const { createServer } = await import("node:http");
+  const { requestIdToken } = await import("../dist/action/lib.js");
+  let seen;
+  const server = createServer((req, res) => {
+    seen = { url: new URL(req.url, "http://x"), auth: req.headers.authorization };
+    res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ value: "a.b.c" }));
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  try {
+    const env = { ACTIONS_ID_TOKEN_REQUEST_URL: `http://127.0.0.1:${server.address().port}/token?api-version=2.0`, ACTIONS_ID_TOKEN_REQUEST_TOKEN: "runner" };
+    assert.equal(await requestIdToken("https://api.example.com", env), "a.b.c");
+    assert.equal(seen.url.searchParams.get("audience"), "https://api.example.com");
+    assert.equal(seen.url.searchParams.get("api-version"), "2.0");
+    assert.equal(seen.auth, "Bearer runner");
+    await assert.rejects(requestIdToken("https://api.example.com", {}), /id-token: write/);
+  } finally {
+    server.close();
+  }
+});

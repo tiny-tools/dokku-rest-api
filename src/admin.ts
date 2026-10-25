@@ -6,6 +6,7 @@ import { APP_PATTERN_RE, expandScopes, isScope, SCOPE_ALIASES, SCOPES } from "./
 const SETTINGS = {
   "webhook-url": "URL that receives a JSON POST after every app deploy",
   "webhook-secret": "Secret used to sign webhook payloads (X-Dokku-Api-Signature: sha256=<hmac>)",
+  "oidc-audience": "Audience GitHub OIDC tokens must carry, the API's base URL (set by api:setup)",
 } as const;
 
 export const HELP = `Usage: dokku api[:COMMAND]
@@ -19,7 +20,12 @@ Additional commands:
                                                                        Create a token (printed once)
     api:token-list                                                     List tokens
     api:token-revoke <name>                                            Revoke a token immediately
-    api:perm-add <name> --app <pattern> --scope <scopes>               Grant scopes on apps matching <pattern>
+    api:trust-github <owner/repo> [--app <pattern> --scope <scopes>]... [--environment <env>]
+                     [--branch <glob> | --tag <glob> | --ref <glob>] [--workflow <file>] [--name <name>] [--expires-in <90d>]
+                                                                       Let GitHub Actions of a repository in without a secret (OIDC)
+    api:trust-list                                                     List GitHub trusts
+    api:trust-revoke <name>                                            Revoke a GitHub trust immediately
+    api:perm-add <name> --app <pattern> --scope <scopes>               Grant scopes on apps matching <pattern> (token or trust)
     api:perm-remove <name> --app <pattern> --scope <scopes>            Remove granted scopes
     api:perm-list [<name>]                                             List permissions
     api:allowlist-add <command> [--flags <regex>] [--scope <scope>] [--token <name>] [--no-app] [--description <text>]
@@ -59,6 +65,55 @@ function requireToken(store: Store, name: string | undefined) {
   return token;
 }
 
+function requireTrust(store: Store, name: string | undefined) {
+  const token = requireToken(store, name);
+  if (token.kind !== "github") throw new UsageError(`"${token.name}" is an API token, not a GitHub trust (use api:token-revoke)`);
+  return token;
+}
+
+// --expires-in / --expires-at, shared by tokens and trusts.
+function expiry(values: Record<string, unknown>): string | null {
+  if (values["expires-in"]) return new Date(Date.now() + parseDuration(values["expires-in"] as string)).toISOString();
+  if (values["expires-at"]) {
+    const ts = Date.parse(values["expires-at"] as string);
+    if (Number.isNaN(ts)) throw new UsageError("invalid --expires-at");
+    return new Date(ts).toISOString();
+  }
+  return null;
+}
+
+const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+
+// Accepts "owner/repo" as well as a pasted "https://github.com/owner/repo(.git)".
+function parseRepository(input: string | undefined): string {
+  const repo = (input ?? "").replace(/^(https:\/\/)?github\.com\//i, "").replace(/\.git$/, "").replace(/\/+$/, "");
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) throw new UsageError("missing or invalid repository, expected <owner>/<repo>");
+  return repo;
+}
+
+function refPattern(values: Record<string, unknown>): string | null {
+  const given = (["branch", "tag", "ref"] as const).filter((k) => values[k] !== undefined);
+  if (given.length > 1) throw new UsageError("give only one of --branch, --tag and --ref");
+  const [kind] = given;
+  if (!kind) return null;
+  const value = values[kind] as string;
+  if (!/^[A-Za-z0-9_.\/*+-]+$/.test(value)) throw new UsageError(`invalid --${kind} "${value}"`);
+  return kind === "branch" ? `refs/heads/${value}` : kind === "tag" ? `refs/tags/${value}` : value;
+}
+
+// "deploy.yml" -> ".github/workflows/deploy.yml"
+function workflowFile(value: string | undefined): string | null {
+  if (value === undefined) return null;
+  if (!/^[A-Za-z0-9_.\/-]+\.ya?ml$/.test(value)) throw new UsageError(`invalid --workflow "${value}", expected e.g. deploy.yml`);
+  return value.includes("/") ? value.replace(/^\.?\//, "") : `.github/workflows/${value}`;
+}
+
+function describePermissions(store: Store, tokenId: number): string {
+  const byApp = new Map<string, string[]>();
+  for (const p of store.listPermissions(tokenId)) byApp.set(p.app_pattern, [...(byApp.get(p.app_pattern) ?? []), p.scope]);
+  return [...byApp].map(([app, scopes]) => `${app} (${scopes.join(", ")})`).join("; ") || "none yet";
+}
+
 function checkPattern(pattern: string): string {
   if (!APP_PATTERN_RE.test(pattern)) throw new UsageError(`invalid app pattern "${pattern}"`);
   return pattern;
@@ -91,7 +146,8 @@ async function report(store: Store): Promise<string> {
     `=====> api report`,
     `       Daemon:            ${daemon} on http://${host}:${port}`,
     `       Database:          ${process.env.DOKKU_API_DB || "/var/lib/dokku/data/api/storage.db"}`,
-    `       Active tokens:     ${tokens.filter((t) => !t.revoked).length} (${tokens.length} total)`,
+    `       Active tokens:     ${tokens.filter((t) => !t.revoked && t.kind === "token").length} (${tokens.filter((t) => t.kind === "token").length} total)`,
+    `       GitHub trusts:     ${tokens.filter((t) => !t.revoked && t.kind === "github").length} (${tokens.filter((t) => t.kind === "github").length} total)`,
     `       Allow-list rules:  ${store.listAllowlist().length}`,
   ];
   for (const key of Object.keys(SETTINGS)) {
@@ -128,17 +184,11 @@ export async function run(argv: string[], store: Store, out: (s: string) => void
         "expires-at": { type: "string" },
       });
       const name = positionals[0];
-      if (!name || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(name)) throw new UsageError("missing or invalid token name");
+      if (!name || !NAME_RE.test(name)) throw new UsageError("missing or invalid token name");
       if (store.getTokenByName(name)) throw new UsageError(`token "${name}" already exists`);
       const pairs = grants((values.app as string[]) ?? [], (values.scope as string[]) ?? []);
       pairs.forEach(([, s]) => expandScopes(s));
-      let expiresAt: string | null = null;
-      if (values["expires-in"]) expiresAt = new Date(Date.now() + parseDuration(values["expires-in"] as string)).toISOString();
-      if (values["expires-at"]) {
-        const ts = Date.parse(values["expires-at"] as string);
-        if (Number.isNaN(ts)) throw new UsageError("invalid --expires-at");
-        expiresAt = new Date(ts).toISOString();
-      }
+      const expiresAt = expiry(values);
       const { token, row } = store.createToken(name, expiresAt);
       for (const [app, scopes] of pairs) for (const s of expandScopes(scopes)) store.addPermission(row.id, app, s);
       out(`=====> Created token "${name}"${expiresAt ? ` (expires ${expiresAt})` : ""}`);
@@ -152,7 +202,7 @@ export async function run(argv: string[], store: Store, out: (s: string) => void
 
     case "token-list": {
       const now = Date.now();
-      const rows = store.listTokens().map((t) => ({
+      const rows = store.listTokens("token").map((t) => ({
         ...t,
         status: t.revoked ? "revoked" : t.expires_at && Date.parse(t.expires_at) <= now ? "expired" : "active",
       }));
@@ -164,6 +214,90 @@ export async function run(argv: string[], store: Store, out: (s: string) => void
       const token = requireToken(store, rest[0]);
       store.revokeToken(token.id);
       out(`=====> Revoked token "${token.name}"`);
+      return;
+    }
+
+    case "trust-github": {
+      const { values, positionals } = opts({
+        app: { type: "string", multiple: true },
+        scope: { type: "string", multiple: true },
+        environment: { type: "string" },
+        branch: { type: "string" },
+        tag: { type: "string" },
+        ref: { type: "string" },
+        workflow: { type: "string" },
+        name: { type: "string" },
+        "expires-in": { type: "string" },
+        "expires-at": { type: "string" },
+      });
+      const repository = parseRepository(positionals[0]);
+      const environment = (values.environment as string | undefined)?.trim() || null;
+      if (environment !== null && !/^[^\x00-\x1f]{1,255}$/.test(environment)) throw new UsageError("invalid --environment");
+      const ref = refPattern(values);
+      const workflow = workflowFile(values.workflow as string | undefined);
+      const pairs = grants((values.app as string[]) ?? [], (values.scope as string[]) ?? []);
+      pairs.forEach(([, s]) => expandScopes(s));
+      const expiresAt = expiry(values);
+
+      const repoName = repository.split("/")[1]!;
+      const name =
+        (values.name as string | undefined) ??
+        `github-${repoName}${environment ? `-${environment}` : ""}`.replace(/[^A-Za-z0-9_.-]+/g, "-").slice(0, 64);
+      if (!NAME_RE.test(name)) throw new UsageError(`invalid name "${name}"`);
+      if (store.getTokenByName(name)) throw new UsageError(`"${name}" already exists; choose another name with --name`);
+
+      const trust = store.createGithubTrust(name, { repository, environment, ref_pattern: ref, workflow }, expiresAt);
+      for (const [app, scopes] of pairs) for (const s of expandScopes(scopes)) store.addPermission(trust.id, app, s);
+
+      const audience = store.getSetting("oidc-audience");
+      const firstApp = pairs[0]?.[0];
+      out(`=====> Trusting GitHub Actions of ${repository} as "${name}"`);
+      out(`       Environment:  ${environment ?? "any"}`);
+      out(`       Ref:          ${ref ?? "any"}`);
+      out(`       Workflow:     ${workflow ?? "any"}`);
+      out(`       Expires:      ${expiresAt ?? "never"}`);
+      out(`       Permissions:  ${describePermissions(store, trust.id)}`);
+      if (pairs.length === 0) out(`       Grant access with: dokku api:perm-add ${name} --app <app> --scope deploy`);
+      if (!environment && !ref) {
+        out(`       Note: every workflow run in this repository gets these permissions, including runs`);
+        out(`       on feature branches. Limit it with --environment or --branch/--tag.`);
+      }
+      if (!audience) out(` !     GitHub OIDC is not set up yet: run dokku api:setup --domain <domain>`);
+      out("");
+      out(`       In the workflow:`);
+      out(`         jobs:`);
+      out(`           deploy:`);
+      out(`             runs-on: ubuntu-latest`);
+      if (environment) out(`             environment: ${environment}`);
+      out(`             permissions:`);
+      out(`               contents: read`);
+      out(`               id-token: write`);
+      out(`             steps:`);
+      out(`               - uses: tiny-tools/dokku-rest-api@v1`);
+      out(`                 with:`);
+      out(`                   dokku_url: ${audience ?? "https://<domain>"}`);
+      out(`                   app_name: ${firstApp && !firstApp.includes("*") ? firstApp : "<app>"}`);
+      return;
+    }
+
+    case "trust-list": {
+      const now = Date.now();
+      const rows = store.listGithubTrusts().map((t) => ({
+        ...t,
+        environment: t.environment ?? "any",
+        ref: t.ref_pattern ?? "any",
+        workflow: t.workflow ?? "any",
+        pinned: t.repository_id ? "yes" : "on first use",
+        status: t.revoked ? "revoked" : t.expires_at && Date.parse(t.expires_at) <= now ? "expired" : "active",
+      }));
+      out(table(rows, ["name", "repository", "environment", "ref", "workflow", "status", "pinned", "expires_at", "last_used_at"]));
+      return;
+    }
+
+    case "trust-revoke": {
+      const trust = requireTrust(store, rest[0]);
+      store.revokeToken(trust.id);
+      out(`=====> Revoked GitHub trust "${trust.name}"`);
       return;
     }
 

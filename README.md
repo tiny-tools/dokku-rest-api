@@ -1,14 +1,27 @@
 # dokku-rest-api
 
-**Control your Dokku apps over HTTPS with scoped API tokens instead of SSH keys.**
+**Deploy to Dokku from GitHub Actions without SSH keys and without secrets.**
 
 `dokku-rest-api` is a Dokku plugin. It runs a small HTTP daemon on your Dokku host and gives you:
 
+- **Secret-free deploys from GitHub Actions.** You tell the server once which repository may do what (`dokku api:trust-github`). The workflow proves who it is with an ID token from GitHub (OIDC). No repository needs an SSH key or a token stored in its secrets.
 - **A REST/JSON API** for day-to-day operations: app status, scaling, deploys, restarts, environment variables and logs.
 - **A 1:1 CLI bridge** that passes allow-listed Dokku commands with their arguments straight to the `dokku` binary, without a shell in between.
-- **A GitHub Action** that deploys from CI with nothing more than a URL and a token.
+- **A GitHub Action** that uses all of this with nothing more than a URL.
 
-Each token can be limited to specific apps (`shop-api`, `staging-*` or `*`) and to specific actions (read-only, deploy, config…). A single token can cover several apps with different rights on each.
+Every caller can be limited to specific apps (`shop-api`, `staging-*` or `*`) and to specific actions (read-only, deploy, config…).
+
+### Two ways to sign in
+
+| | GitHub trust (OIDC) | API token |
+|---|---|---|
+| Works from | **GitHub Actions only** (github.com, or GitHub Enterprise Server with its own issuer) | anywhere: curl, scripts, other CI systems (GitLab, Jenkins…), dashboards |
+| Created with | `dokku api:trust-github <owner/repo>` | `dokku api:token-create <name>` |
+| Secret to store | **none** | the token, e.g. as a CI secret |
+| Bound to | repository, and optionally environment, branch/tag and workflow file | whoever holds the token |
+| Lifetime of what travels | a few minutes per request | until it expires or is revoked |
+
+**The secret-free way only works from GitHub Actions**, because only GitHub issues the ID tokens the server checks. That is the intended main use. For everything else, API tokens remain available and work exactly as before. Both kinds share the same permissions, allow-list, revocation and audit log.
 
 ```
 GitHub Actions / curl / dashboards
@@ -32,6 +45,7 @@ SQLite: /var/lib/dokku/data/api/storage.db
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
 - [Installation](#installation)
+- [GitHub Actions without secrets (OIDC)](#github-actions-without-secrets-oidc)
 - [Managing tokens](#managing-tokens)
 - [REST API](#rest-api)
 - [CLI bridge](#cli-bridge)
@@ -45,7 +59,8 @@ SQLite: /var/lib/dokku/data/api/storage.db
 
 ## Features
 
-- Tokens scoped per app, with wildcards, and per action (`read`, `logs`, `config:read`, `config:write`, `scale`, `restart`, `deploy`, `cli`)
+- GitHub Actions sign in without any stored secret (OIDC), limited by repository, environment, branch/tag and workflow
+- Tokens and trusts scoped per app, with wildcards, and per action (`read`, `logs`, `config:read`, `config:write`, `scale`, `restart`, `deploy`, `cli`)
 - Optional token expiry, instant revocation and an audit log of every request
 - REST endpoints for status, formation, deploys (image, git or rebuild), restart/start/stop, config and logs
 - A generic CLI bridge, so new Dokku commands work without new endpoints once you allow-list them
@@ -67,19 +82,37 @@ Deliberately left out for now: destroying apps and unsetting environment variabl
 # 1. On the Dokku host: install the plugin (as root)
 sudo dokku plugin:install https://github.com/tiny-tools/dokku-rest-api.git --name api
 
-# 2. Expose the API on a domain
-dokku api:setup --domain api.dokku.example.com
+# 2. Expose the API on a domain, with TLS (see "Exposing the API with TLS")
+dokku api:setup --domain api.dokku.example.com --ssl-cert … --ssl-key …
 
-# 3. Create a token for CI with read/write access to one app
-dokku api:token-create github-prod --app shop-api --scope readwrite --expires-in 90d
-#    → prints dk_live_… exactly once
-
-# 4. Try it
-curl -s https://api.dokku.example.com/api/v1/apps/shop-api/status \
-  -H "Authorization: Bearer dk_live_…"
+# 3. Let the GitHub Actions of a repository deploy one app
+dokku api:trust-github my-org/shop-api --app shop-api --scope deploy
 ```
 
-Then store the token as the `DOKKU_API_TOKEN` secret in GitHub and use the [GitHub Action](#github-action).
+```yaml
+# 4. In my-org/shop-api, .github/workflows/deploy.yml
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write      # lets the job request its ID token from GitHub
+    steps:
+      - uses: tiny-tools/dokku-rest-api@v1
+        with:
+          dokku_url: https://api.dokku.example.com
+          app_name: shop-api
+          deploy_repository: https://github.com/my-org/shop-api.git
+          deploy_ref: ${{ github.sha }}
+```
+
+No secret is stored anywhere. For access from outside GitHub Actions, create an [API token](#managing-tokens) instead:
+
+```sh
+dokku api:token-create dashboard --app shop-api --scope readonly --expires-in 90d
+#    → prints dk_live_… exactly once
+curl -s https://api.dokku.example.com/api/v1/apps/shop-api/status -H "Authorization: Bearer dk_live_…"
+```
 
 ## Installation
 
@@ -115,11 +148,69 @@ dokku api:setup --domain api.dokku.example.com \
   --ssl-key  /etc/letsencrypt/live/api.dokku.example.com/privkey.pem
 ```
 
-`api:setup` validates the generated config with `nginx -t` and restores the previous version if nginx rejects it.
+`api:setup` validates the generated config with `nginx -t` and restores the previous version if nginx rejects it. It also stores the API's URL (`https://<domain>`) as the `oidc-audience` setting, which [GitHub trusts](#github-actions-without-secrets-oidc) need.
+
+**Behind Cloudflare or another proxy:** deploys run as one long request (often several minutes). Cloudflare's proxy cuts requests after 100 seconds, so point the API's hostname at the server directly (DNS only, no proxy).
+
+## GitHub Actions without secrets (OIDC)
+
+### How it works
+
+1. On the server you trust a repository once: `dokku api:trust-github my-org/shop-api …`. This stores a rule, not a secret.
+2. A workflow job with `permissions: id-token: write` asks GitHub for an ID token. It is a JWT signed by GitHub that says which repository, environment, branch or tag and workflow the run belongs to. It expires after a few minutes.
+3. The action sends it instead of an API token, and requests a fresh one for every call, because a deploy can outlast a single token.
+4. The daemon checks GitHub's signature with GitHub's public keys (`https://token.actions.githubusercontent.com/.well-known/jwks`, cached for an hour), the issuer, the expiry and the audience. Then it looks for a trust that matches the token's claims.
+5. From there it is the same as with an API token: the trust's permissions decide which apps and actions are allowed.
+
+The audience is the API's URL (`oidc-audience`, set by `api:setup`). A token minted for one server is therefore useless on another.
+
+### Creating a trust
+
+```sh
+dokku api:trust-github <owner/repo> [options]
+```
+
+Only the repository is required. `https://github.com/owner/repo.git` can be pasted as is. Everything else is optional:
+
+| Option | Default | Effect |
+|---|---|---|
+| `--app <pattern> --scope <scopes>` | no permissions | what the trust may do, like `token-create`; repeatable; can also be added later with `api:perm-add` |
+| `--environment <name>` | any | only jobs that run in this [GitHub environment](https://docs.github.com/actions/deployment/targeting-different-environments) (`environment: production` in the job); case-insensitive |
+| `--branch <glob>` | any | only runs on this branch, e.g. `main` (stored as `refs/heads/main`) |
+| `--tag <glob>` | any | only runs for this tag, e.g. `'v*'` (stored as `refs/tags/v*`) |
+| `--ref <glob>` | any | a raw ref pattern instead of `--branch`/`--tag`, e.g. `refs/pull/*` |
+| `--workflow <file>` | any | only this workflow file, e.g. `deploy.yml` (`.github/workflows/deploy.yml`) |
+| `--name <name>` | `github-<repo>[-<environment>]` | the name used by `perm-*`, `trust-revoke` and the audit log |
+| `--expires-in <90d>` / `--expires-at <date>` | never | the trust stops working after that |
+
+The command prints the conditions, the permissions and a workflow snippet that fits them.
+
+```sh
+# Staging: pushes to main deploy both apps
+dokku api:trust-github my-org/shop --environment staging --branch main \
+  --app 'shop-*' --scope deploy,read
+
+# Production: only release tags, only from deploy.yml
+dokku api:trust-github my-org/shop --environment production --tag 'v*' --workflow deploy.yml \
+  --app 'shop-*' --scope deploy,read
+
+dokku api:trust-list                      # conditions, status, last use
+dokku api:perm-add github-shop-production --app shop-worker --scope scale
+dokku api:trust-revoke github-shop-staging   # takes effect immediately
+```
+
+### Rules
+
+- **A trust without conditions applies to every workflow run of the repository**, including runs on feature branches. `trust-github` points this out. For production, use `--environment` and protect that environment in GitHub (Settings → Environments → deployment branches and tags, optionally required reviewers). Anyone who can push a workflow to an allowed branch can deploy, the same as with a stored secret.
+- **The repository ID is pinned on first use.** Should the repository be deleted and its name taken again, or be transferred, the trust no longer matches. Create a new trust in that case.
+- **The most specific trust wins.** Environment, ref and workflow each count as one condition. If two equally specific trusts match, the request is refused with a message naming both.
+- **Pull requests from forks get no ID token from GitHub** and therefore can never use a trust.
+- The daemon needs outbound HTTPS to `token.actions.githubusercontent.com`. If GitHub is unreachable and no keys are cached yet, requests fail with `503`.
+- **GitHub Enterprise Server:** set `DOKKU_API_GITHUB_OIDC_ISSUER` to its issuer (`https://<host>/_services/token`) in `/etc/default/dokku-api`.
 
 ## Managing tokens
 
-All management happens on the host through `dokku api:*`. Run `dokku api:help` for the full list.
+API tokens are for everything outside GitHub Actions. All management happens on the host through `dokku api:*`. Run `dokku api:help` for the full list. The `perm-*` commands work for tokens and GitHub trusts alike.
 
 ```sh
 # Read-only dashboard token for all staging apps
@@ -163,14 +254,14 @@ App patterns are exact names, globs with `*` (`staging-*`), or `*` for all apps.
 ## REST API
 
 - Base path: `/api/v1`
-- Authentication: `Authorization: Bearer dk_live_…` on every endpoint except `/health`
+- Authentication: `Authorization: Bearer <token>` on every endpoint except `/health`, where `<token>` is an API token (`dk_live_…`) or a GitHub Actions ID token
 - Request and response bodies are JSON (`Content-Type: application/json`)
 - Errors use [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) `application/problem+json`
 
 | Status | Meaning |
 |--------|---------|
 | `400`  | invalid input (app name, body, query) |
-| `401`  | token missing, invalid, revoked or expired |
+| `401`  | token missing, invalid, revoked or expired; or no GitHub trust matches |
 | `403`  | token lacks the scope for this app, or the command or argument isn't allowed |
 | `404`  | unknown route, app or config key |
 | `422`  | the Dokku command ran but exited non-zero; the body has `exit_code`, `stdout` and `stderr` |
@@ -325,6 +416,8 @@ For service plugins (`postgres:*`, `redis:*`, …), `app` is the first positiona
 
 ## GitHub Action
 
+Without `api_token`, the action signs in as the workflow run via OIDC. That needs `id-token: write` in the job's permissions and a matching [`dokku api:trust-github`](#github-actions-without-secrets-oidc) on the server.
+
 ```yaml
 name: Deploy
 on:
@@ -334,6 +427,11 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -345,7 +443,6 @@ jobs:
       - uses: tiny-tools/dokku-rest-api@v1
         with:
           dokku_url: https://api.dokku.example.com
-          api_token: ${{ secrets.DOKKU_API_TOKEN }}
           app_name: shop-api
           config: |
             RELEASE_SHA=${{ github.sha }}
@@ -358,7 +455,8 @@ jobs:
 | Input               | Default | Description |
 |---------------------|---------|-------------|
 | `dokku_url`         |         | API base URL (required) |
-| `api_token`         |         | API token (required, masked in logs) |
+| `api_token`         |         | API token (masked in logs); leave it out to sign in via GitHub OIDC |
+| `audience`          | origin of `dokku_url` | audience of the OIDC token; must equal the server's `oidc-audience` |
 | `app_name`          |         | target app |
 | `config`            |         | `KEY=value` per line; `#` comments allowed |
 | `config_restart`    | `true`  | restart after setting config; skipped automatically when a deploy follows |
@@ -372,6 +470,10 @@ jobs:
 | `timeout_seconds`   | `900`   | HTTP timeout per request |
 
 Steps run in this order: config → deploy → scale → restart → cli_commands. If none of these inputs is set, the action just reports the app status.
+
+To build from source on the server, use `deploy_repository` with `deploy_ref: ${{ github.sha }}`. Dokku then fetches the repository itself (`git:sync --build`). For a private repository, give the server read access once, for example with a fine-grained GitHub token that may only read contents: `dokku git:auth github.com <user> <token>`.
+
+**Using the action from a private copy of this repository:** in that repository, allow access under Settings → Actions → General → Access ("Accessible from repositories in the organization").
 
 ### Outputs
 
@@ -408,17 +510,21 @@ The systemd unit and `dokku api:*` read `/etc/default/dokku-api`:
 | `DOKKU_API_DB`              | `/var/lib/dokku/data/api/storage.db` | |
 | `DOKKU_API_NODE`            | node found at install time           | |
 | `DOKKU_API_EXEC_TIMEOUT_MS` | `900000`                             | maximum runtime of one Dokku command |
+| `DOKKU_API_GITHUB_OIDC_ISSUER` | `https://token.actions.githubusercontent.com` | only for GitHub Enterprise Server |
 
 After editing the file, apply the change with `sudo systemctl restart dokku-api`.
 
+Settings stored in the database are changed with `dokku api:set <key> [<value>]`: `webhook-url`, `webhook-secret` and `oidc-audience` (the API's URL as GitHub Actions call it; `api:setup` sets it).
+
 ## Security model
 
+- **GitHub trusts** store no secret at all. A request is accepted only with an ID token that GitHub signed (RS256, checked against GitHub's published keys), that names this server as its audience, that has not expired, and whose repository (pinned by ID), environment, ref and workflow match a trust.
 - **Tokens** are 256-bit random values (`dk_live_…`). Only their SHA-256 hash is stored, and they are shown exactly once.
 - **Least privilege:** every request needs a concrete scope on the concrete app. The app list is filtered to what the token may see.
 - **No shell:** commands run via `execve` with an argv array, so shell injection is impossible by construction.
 - **Validation:** bridge arguments are checked one by one against the allow-list regex. Dokku's global flags (`--app`, `--global`, `--all`, `--trace`) are hard-blocked, and Dokku-specific environment variables are stripped from the child process.
 - **Network:** the daemon listens on loopback only. nginx overwrites `X-Forwarded-For`, so the client IPs in the audit log can't be spoofed.
-- **Audit:** every authenticated request is logged with token, path, command, app, status and exit code, but never with config values. Revoking a token keeps its history.
+- **Audit:** every authenticated request is logged with token or trust name, path, command, app, status and exit code, but never with config values. Revoking keeps the history.
 
 ## Troubleshooting
 
@@ -429,6 +535,11 @@ After editing the file, apply the change with `sudo systemctl restart dokku-api`
 | Install fails with "Node.js >= 22.13 is required" | install a current Node.js and re-run `sudo dokku plugin:install` |
 | `502 Bad Gateway` from nginx | the daemon isn't running, or `DOKKU_API_PORT` differs from the port in the nginx config (re-run `api:setup`) |
 | `401` | `dokku api:token-list` shows whether the token is revoked or expired |
+| `401 no active trust matches repository …` | `dokku api:trust-list`: compare environment, ref and workflow with the run; the message names the run's environment and ref |
+| `401 GitHub OIDC is not set up on this server` | run `dokku api:setup --domain …`, or `dokku api:set oidc-audience https://<domain>` |
+| `401 OIDC token audience must be …` | `dokku_url` (or the action's `audience` input) differs from the server's `oidc-audience` |
+| Action: `no GitHub OIDC token available` | add `permissions: id-token: write` to the job |
+| `503 cannot fetch GitHub's OIDC signing keys` | the server cannot reach `token.actions.githubusercontent.com` |
 | `403 Missing scope` | `dokku api:perm-list <token>` |
 | `403 Argument not permitted` | compare the argument with the regex in `dokku api:allowlist-list` |
 | Deploys time out in the client | raise the client timeout; the server allows up to `DOKKU_API_EXEC_TIMEOUT_MS` |
@@ -474,6 +585,7 @@ DOKKU_API_DB=./dev.db DOKKU_API_DOKKU_BIN=$PWD/test/fake-dokku.mjs bin/dokku-api
 ├── bin/dokku-api         launcher for dist/{daemon,cli,webhook}.js
 ├── src/
 │   ├── server.ts         HTTP server and REST routes
+│   ├── oidc.ts           GitHub Actions OIDC: token verification, trust matching
 │   ├── allowlist.ts      CLI bridge authorisation and default allow-list
 │   ├── db.ts             SQLite schema, migrations, queries
 │   ├── scopes.ts         scopes, aliases, glob matching

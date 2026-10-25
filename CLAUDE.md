@@ -7,6 +7,7 @@ Guidance for working in this repository. User-facing documentation lives in `REA
 A Dokku plugin (installed as `api`, so commands are `dokku api:*`) plus a GitHub Action, in one repo:
 
 - **Daemon** (`src/server.ts`): a `node:http` server on `127.0.0.1:5099`, run by systemd as the `dokku` user. It offers REST endpoints and a 1:1 CLI bridge, and it executes `/usr/bin/dokku` via `execve`.
+- **GitHub OIDC** (`src/oidc.ts`): verifies GitHub Actions ID tokens and maps them to trusts (`dokku api:trust-github`), so CI needs no stored secret.
 - **Persistence** (`src/db.ts`): SQLite via the built-in `node:sqlite`, stored at `/var/lib/dokku/data/api/storage.db`.
 - **Admin CLI** (`src/admin.ts`): the implementation behind `dokku api:*`.
 - **Plugin hooks** (bash, at the repo root): `install`, `uninstall`, `post-deploy`, `commands`, `subcommands/*`.
@@ -36,6 +37,9 @@ CI (`.github/workflows/ci.yml`) runs the tests, fails if `dist/` differs from a 
 
 ## Authorisation model
 
+- Two kinds of principal share the `tokens` table (`kind`): `token` (bearer secret, hash in `token_hash`) and `github` (an OIDC trust; conditions in `github_trusts`, `token_hash` is a random non-hex placeholder that no secret can match). Permissions, allow-list entries, expiry, revocation and the audit log therefore work the same for both. Never let `findTokenBySecret` return a `github` row.
+- A bearer value that looks like a JWT goes through `authenticateGithub`: RS256 signature against GitHub's JWKS, `iss`, `aud` = the `oidc-audience` setting (written by `api:setup`), `exp`/`nbf`/`iat` with 60 s leeway. Then `selectTrust` picks the matching trust with the most conditions (environment, ref, workflow); equal matches are refused. `repository_id`/`repository_owner_id` are pinned on first use. `DOKKU_API_GITHUB_OIDC_ISSUER` overrides the issuer (GHES, tests).
+- The action requests a fresh ID token per HTTP request, because tokens expire within minutes and a deploy can take longer.
 - `token_permissions` holds `(token_id, app_pattern, scope)` rows. App patterns are globs (`shop-*`, `*`). Scopes are defined in `src/scopes.ts`, and aliases (`readonly`, `readwrite`, `all`) are expanded **before** storing.
 - Every REST route declares exactly one `scope`, which is checked against the `{app}` path param in `createApiServer`. Routes without an app param that need a scope check it themselves (see `GET /apps`).
 - CLI bridge (`authorizeCli`): a matching allow-list entry (global or token-bound), plus the entry's `scope` on the app, plus every argument matching the entry's regex. Entries with `require_app_match = 0` need the scope on the literal pattern `*`.
@@ -57,6 +61,7 @@ CI (`.github/workflows/ci.yml`) runs the tests, fails if `dist/` differs from a 
 ## Tests
 
 - `test/api.test.mjs` starts the real server on a random port with a temp DB and points `DOKKU_API_DOKKU_BIN` at `test/fake-dokku.mjs`. The fake binary logs every argv to `FAKE_DOKKU_LOG`, so tests assert on the exact argv passed to dokku. Every denial test should also assert that `calls()` is empty.
+- `test/oidc.test.mjs` signs real RS256 tokens with a generated key and serves the JWKS from a local server (via `DOKKU_API_GITHUB_OIDC_ISSUER`). Add a case there for every new claim check.
 - `test/action.test.mjs` covers the action's input parsers (`src/action/lib.ts`). `src/action/main.ts` is the only file with side effects.
 - Tests import from `dist/`, so `npm test` always builds first.
 

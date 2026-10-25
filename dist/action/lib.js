@@ -32,11 +32,34 @@ export class ApiError extends Error {
         this.body = body;
     }
 }
+// Requests a GitHub Actions OIDC token for `audience`. GitHub only offers
+// this to jobs with `permissions: id-token: write`.
+export async function requestIdToken(audience, env = process.env) {
+    const url = env.ACTIONS_ID_TOKEN_REQUEST_URL;
+    const bearer = env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+    if (!url || !bearer) {
+        throw new Error('no api_token given and no GitHub OIDC token available: add "permissions: id-token: write" to the job');
+    }
+    const target = new URL(url);
+    target.searchParams.set("audience", audience);
+    const res = await fetch(target, {
+        headers: { Authorization: `Bearer ${bearer}`, Accept: "application/json" },
+        signal: AbortSignal.timeout(30_000),
+    });
+    if (!res.ok)
+        throw new Error(`requesting a GitHub OIDC token failed with HTTP ${res.status}`);
+    const body = (await res.json());
+    if (typeof body.value !== "string" || !body.value)
+        throw new Error("GitHub returned no OIDC token");
+    return body.value;
+}
 export class Client {
     baseUrl;
     token;
     timeoutMs;
-    constructor(baseUrl, token, timeoutMs) {
+    constructor(baseUrl, 
+    // Called per request: OIDC tokens expire within minutes, and a deploy can take longer.
+    token, timeoutMs) {
         this.baseUrl = baseUrl;
         this.token = token;
         this.timeoutMs = timeoutMs;
@@ -45,7 +68,7 @@ export class Client {
         const res = await fetch(`${this.baseUrl}/api/v1${path}`, {
             method,
             headers: {
-                Authorization: `Bearer ${this.token}`,
+                Authorization: `Bearer ${await this.token()}`,
                 Accept: "application/json",
                 ...(body === undefined ? {} : { "Content-Type": "application/json" }),
                 "User-Agent": "dokku-api-action",
@@ -140,13 +163,24 @@ export function parseCliCommands(text, app) {
 }
 export async function run() {
     const url = input("dokku_url").replace(/\/+$/, "").replace(/\/api\/v1$/, "");
-    const token = input("api_token");
+    const apiToken = input("api_token");
     const app = input("app_name");
     if (!url)
         throw new Error('input "dokku_url" is required');
-    if (!token)
-        throw new Error('input "api_token" is required');
-    console.log(`::add-mask::${token}`);
+    let token;
+    if (apiToken) {
+        console.log(`::add-mask::${apiToken}`);
+        token = async () => apiToken;
+    }
+    else {
+        // No secret: authenticate as this workflow run via GitHub OIDC.
+        const audience = input("audience") || new URL(url).origin;
+        token = async () => {
+            const jwt = await requestIdToken(audience);
+            console.log(`::add-mask::${jwt}`);
+            return jwt;
+        };
+    }
     const timeoutSeconds = Number(input("timeout_seconds", "900"));
     if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0)
         throw new Error('input "timeout_seconds" must be a positive number');
