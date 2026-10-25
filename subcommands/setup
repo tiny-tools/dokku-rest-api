@@ -60,7 +60,9 @@ cmd-api-setup() {
   for path in "$SSL_CERT" "$SSL_KEY"; do
     [[ -z "$path" ]] || [[ "$path" =~ ^/[A-Za-z0-9._/@-]+$ ]] || dokku_log_fail "Invalid path: $path"
   done
-  [[ -d "$NGINX_DIR" ]] && [[ -w "$NGINX_DIR" ]] || dokku_log_fail "$NGINX_DIR is missing; re-run: sudo dokku plugin:install"
+  if [[ ! -d "$NGINX_DIR" ]] || [[ ! -w "$NGINX_DIR" ]]; then
+    dokku_log_fail "$NGINX_DIR is missing; re-run: sudo dokku plugin:install"
+  fi
 
   local PORT=5099
   if [[ -r /etc/default/dokku-api ]]; then
