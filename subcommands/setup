@@ -60,7 +60,9 @@ cmd-api-setup() {
   for path in "$SSL_CERT" "$SSL_KEY"; do
     [[ -z "$path" ]] || [[ "$path" =~ ^/[A-Za-z0-9._/@-]+$ ]] || dokku_log_fail "Invalid path: $path"
   done
-  [[ -d "$NGINX_DIR" ]] && [[ -w "$NGINX_DIR" ]] || dokku_log_fail "$NGINX_DIR is missing; re-run: sudo dokku plugin:install"
+  if [[ ! -d "$NGINX_DIR" ]] || [[ ! -w "$NGINX_DIR" ]]; then
+    dokku_log_fail "$NGINX_DIR is missing; re-run: sudo dokku plugin:install"
+  fi
 
   local PORT=5099
   if [[ -r /etc/default/dokku-api ]]; then
@@ -110,8 +112,15 @@ cmd-api-setup() {
   rm -f "$BACKUP"
   fn-api-nginx-reload
 
+  # GitHub OIDC tokens must name this URL as their audience; the action
+  # requests them for its dokku_url.
+  local SCHEME=http
+  [[ -n "$SSL_CERT" ]] && SCHEME=https
+  "$(dirname "$0")/../bin/dokku-api" cli set oidc-audience "$SCHEME://$DOMAIN" >/dev/null
+
   if [[ -n "$SSL_CERT" ]]; then
     dokku_log_info1 "API available at https://$DOMAIN/api/v1"
+    dokku_log_info2 "GitHub Actions use dokku_url: https://$DOMAIN"
   else
     dokku_log_info1 "API available at http://$DOMAIN/api/v1"
     dokku_log_warn "No TLS configured - tokens travel in plain text. To add Let's Encrypt:"

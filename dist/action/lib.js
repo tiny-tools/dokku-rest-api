@@ -27,16 +27,74 @@ const endGroup = () => console.log("::endgroup::");
 export const escapeData = (s) => s.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
 export class ApiError extends Error {
     body;
-    constructor(message, body) {
+    status;
+    constructor(message, body, status) {
         super(message);
         this.body = body;
+        this.status = status;
     }
+}
+// Worth another attempt: the dokku command failed (422), the server or proxy
+// had a problem (5xx), or the connection broke. Not retried: input and
+// permission errors, and our own timeout, because the build may still be
+// running on the server.
+export function isRetryable(err) {
+    if (err instanceof ApiError)
+        return err.status === 422 || err.status >= 500;
+    if (err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError"))
+        return false;
+    return err instanceof TypeError; // fetch's network errors
+}
+export async function withRetries(attempt, retries, delayMs, onRetry = () => { }, sleep = (ms) => new Promise((r) => setTimeout(r, ms))) {
+    for (let left = retries;; left--) {
+        try {
+            return await attempt();
+        }
+        catch (err) {
+            if (left <= 0 || !isRetryable(err))
+                throw err;
+            onRetry(err, left);
+            await sleep(delayMs);
+        }
+    }
+}
+function intInput(name, fallback) {
+    const raw = input(name);
+    if (raw === "")
+        return fallback;
+    const value = Number(raw);
+    if (!Number.isInteger(value) || value < 0)
+        throw new Error(`input "${name}" must be a whole number of 0 or more`);
+    return value;
+}
+// Requests a GitHub Actions OIDC token for `audience`. GitHub only offers
+// this to jobs with `permissions: id-token: write`.
+export async function requestIdToken(audience, env = process.env) {
+    const url = env.ACTIONS_ID_TOKEN_REQUEST_URL;
+    const bearer = env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+    if (!url || !bearer) {
+        throw new Error('no api_token given and no GitHub OIDC token available: add "permissions: id-token: write" to the job');
+    }
+    const target = new URL(url);
+    target.searchParams.set("audience", audience);
+    const res = await fetch(target, {
+        headers: { Authorization: `Bearer ${bearer}`, Accept: "application/json" },
+        signal: AbortSignal.timeout(30_000),
+    });
+    if (!res.ok)
+        throw new Error(`requesting a GitHub OIDC token failed with HTTP ${res.status}`);
+    const body = (await res.json());
+    if (typeof body.value !== "string" || !body.value)
+        throw new Error("GitHub returned no OIDC token");
+    return body.value;
 }
 export class Client {
     baseUrl;
     token;
     timeoutMs;
-    constructor(baseUrl, token, timeoutMs) {
+    constructor(baseUrl, 
+    // Called per request: OIDC tokens expire within minutes, and a deploy can take longer.
+    token, timeoutMs) {
         this.baseUrl = baseUrl;
         this.token = token;
         this.timeoutMs = timeoutMs;
@@ -45,7 +103,7 @@ export class Client {
         const res = await fetch(`${this.baseUrl}/api/v1${path}`, {
             method,
             headers: {
-                Authorization: `Bearer ${this.token}`,
+                Authorization: `Bearer ${await this.token()}`,
                 Accept: "application/json",
                 ...(body === undefined ? {} : { "Content-Type": "application/json" }),
                 "User-Agent": "dokku-api-action",
@@ -63,7 +121,7 @@ export class Client {
         }
         if (!res.ok) {
             const detail = [parsed.title, parsed.detail].filter(Boolean).join(": ") || text.slice(0, 500);
-            throw new ApiError(`${method} ${path} failed with HTTP ${res.status}: ${detail}`, parsed);
+            throw new ApiError(`${method} ${path} failed with HTTP ${res.status}: ${detail}`, parsed, res.status);
         }
         return parsed;
     }
@@ -140,13 +198,24 @@ export function parseCliCommands(text, app) {
 }
 export async function run() {
     const url = input("dokku_url").replace(/\/+$/, "").replace(/\/api\/v1$/, "");
-    const token = input("api_token");
+    const apiToken = input("api_token");
     const app = input("app_name");
     if (!url)
         throw new Error('input "dokku_url" is required');
-    if (!token)
-        throw new Error('input "api_token" is required');
-    console.log(`::add-mask::${token}`);
+    let token;
+    if (apiToken) {
+        console.log(`::add-mask::${apiToken}`);
+        token = async () => apiToken;
+    }
+    else {
+        // No secret: authenticate as this workflow run via GitHub OIDC.
+        const audience = input("audience") || new URL(url).origin;
+        token = async () => {
+            const jwt = await requestIdToken(audience);
+            console.log(`::add-mask::${jwt}`);
+            return jwt;
+        };
+    }
     const timeoutSeconds = Number(input("timeout_seconds", "900"));
     if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0)
         throw new Error('input "timeout_seconds" must be a positive number');
@@ -179,8 +248,15 @@ export async function run() {
     if (deploying) {
         needApp("deploy");
         const body = image ? { image } : repository ? { repository, ...(input("deploy_ref") ? { ref: input("deploy_ref") } : {}) } : {};
+        const retries = intInput("deploy_retries", 0);
+        const delaySeconds = intInput("deploy_retry_delay", 60);
         group(image ? `Deploy image ${image}` : repository ? `Deploy ${repository}` : "Rebuild app");
-        const res = await client.request("POST", `${appPath}/deploys`, body);
+        const res = await withRetries(() => client.request("POST", `${appPath}/deploys`, body), retries, delaySeconds * 1000, (err, left) => {
+            if (err instanceof ApiError)
+                printExecution(err.body);
+            const message = err instanceof Error ? err.message : String(err);
+            console.log(`::warning::${escapeData(`Deploy failed (${message}); retrying in ${delaySeconds} s, ${left} attempt(s) left.`)}`);
+        });
         printExecution(res);
         results.push({ step: "deploy", ...res });
         endGroup();

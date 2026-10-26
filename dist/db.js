@@ -59,7 +59,23 @@ const MIGRATIONS = [
   CREATE INDEX idx_allowlist_cmd ON cli_allowlist(command_prefix);
   CREATE INDEX idx_audit_created ON audit_log(created_at);
   `,
+    `
+  ALTER TABLE tokens ADD COLUMN kind TEXT NOT NULL DEFAULT 'token';
+
+  CREATE TABLE github_trusts (
+    token_id INTEGER PRIMARY KEY REFERENCES tokens(id) ON DELETE CASCADE,
+    repository TEXT NOT NULL,
+    repository_id TEXT NULL,
+    repository_owner_id TEXT NULL,
+    environment TEXT NULL,
+    ref_pattern TEXT NULL,
+    workflow TEXT NULL
+  );
+
+  CREATE INDEX idx_trust_repo ON github_trusts(repository);
+  `,
 ];
+const TOKEN_COLUMNS = "id, kind, name, token_prefix, created_at, expires_at, last_used_at, revoked";
 export const TOKEN_PREFIX = "dk_live_";
 export function hashToken(token) {
     return createHash("sha256").update(token).digest("hex");
@@ -113,23 +129,22 @@ export class Store {
     }
     getTokenById(id) {
         return this.db
-            .prepare("SELECT id, name, token_prefix, created_at, expires_at, last_used_at, revoked FROM tokens WHERE id = ?")
+            .prepare(`SELECT ${TOKEN_COLUMNS} FROM tokens WHERE id = ?`)
             .get(id);
     }
     getTokenByName(name) {
         return this.db
-            .prepare("SELECT id, name, token_prefix, created_at, expires_at, last_used_at, revoked FROM tokens WHERE name = ?")
+            .prepare(`SELECT ${TOKEN_COLUMNS} FROM tokens WHERE name = ?`)
             .get(name);
     }
     findTokenBySecret(secret) {
         return this.db
-            .prepare("SELECT id, name, token_prefix, created_at, expires_at, last_used_at, revoked FROM tokens WHERE token_hash = ?")
+            .prepare(`SELECT ${TOKEN_COLUMNS} FROM tokens WHERE token_hash = ? AND kind = 'token'`)
             .get(hashToken(secret));
     }
-    listTokens() {
-        return this.db
-            .prepare("SELECT id, name, token_prefix, created_at, expires_at, last_used_at, revoked FROM tokens ORDER BY name")
-            .all();
+    listTokens(kind) {
+        const stmt = this.db.prepare(`SELECT ${TOKEN_COLUMNS} FROM tokens ${kind ? "WHERE kind = ?" : ""} ORDER BY name`);
+        return (kind ? stmt.all(kind) : stmt.all());
     }
     revokeToken(id) {
         this.db.prepare("UPDATE tokens SET revoked = 1 WHERE id = ?").run(id);
@@ -138,6 +153,37 @@ export class Store {
         this.db
             .prepare("UPDATE tokens SET last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?")
             .run(id);
+    }
+    // --- GitHub trusts ------------------------------------------------------
+    // A trust is a principal like a token, so permissions, allow-list entries,
+    // expiry, revocation and the audit log work unchanged. Its token_hash is
+    // never a SHA-256 hex digest, so no bearer secret can ever match it.
+    createGithubTrust(name, trust, expiresAt) {
+        const info = this.db
+            .prepare("INSERT INTO tokens (kind, name, token_prefix, token_hash, expires_at) VALUES ('github', ?, 'github', ?, ?)")
+            .run(name, `github:${randomBytes(16).toString("hex")}`, expiresAt);
+        const id = Number(info.lastInsertRowid);
+        this.db
+            .prepare("INSERT INTO github_trusts (token_id, repository, environment, ref_pattern, workflow) VALUES (?, ?, ?, ?, ?)")
+            .run(id, trust.repository.toLowerCase(), trust.environment, trust.ref_pattern, trust.workflow);
+        return this.getGithubTrust(id);
+    }
+    getGithubTrust(tokenId) {
+        return this.db
+            .prepare(`SELECT ${TOKEN_COLUMNS}, g.* FROM tokens t JOIN github_trusts g ON g.token_id = t.id WHERE t.id = ?`)
+            .get(tokenId);
+    }
+    listGithubTrusts(repository) {
+        const sql = `SELECT ${TOKEN_COLUMNS}, g.* FROM tokens t JOIN github_trusts g ON g.token_id = t.id
+                 ${repository === undefined ? "" : "WHERE g.repository = ?"} ORDER BY t.name`;
+        const stmt = this.db.prepare(sql);
+        return (repository === undefined ? stmt.all() : stmt.all(repository.toLowerCase()));
+    }
+    pinGithubTrust(tokenId, repositoryId, ownerId) {
+        this.db
+            .prepare(`UPDATE github_trusts SET repository_id = ?, repository_owner_id = ?
+         WHERE token_id = ? AND repository_id IS NULL`)
+            .run(repositoryId, ownerId, tokenId);
     }
     // --- permissions --------------------------------------------------------
     addPermission(tokenId, appPattern, scope) {

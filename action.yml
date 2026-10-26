@@ -1,5 +1,5 @@
 name: Dokku REST API
-description: Deploy, scale, restart and configure Dokku apps through the dokku-api plugin, without SSH keys
+description: Deploy, scale, restart and configure Dokku apps through the dokku-api plugin, without SSH keys or secrets
 author: tiny-tools
 branding:
   icon: upload-cloud
@@ -10,8 +10,14 @@ inputs:
     description: Base URL of the API, e.g. https://api.dokku.example.com
     required: true
   api_token:
-    description: API token created with `dokku api:token-create` (store it as a secret)
-    required: true
+    description: >
+      API token created with `dokku api:token-create` (store it as a secret). Leave it out to sign in
+      as this workflow run via GitHub OIDC instead (needs `permissions: id-token: write` and a
+      `dokku api:trust-github` on the server).
+    required: false
+  audience:
+    description: Audience of the GitHub OIDC token; defaults to the origin of dokku_url, which is what api:setup expects
+    required: false
   app_name:
     description: Target app
     required: false
@@ -31,6 +37,16 @@ inputs:
   deploy_ref:
     description: Branch, tag or commit for deploy_repository
     required: false
+  deploy_retries:
+    description: >
+      Extra attempts when the deploy fails in Dokku or on the way (HTTP 422, 5xx, network error),
+      e.g. when two builds on one server get in each other's way. Not for 4xx errors or client timeouts.
+    required: false
+    default: "0"
+  deploy_retry_delay:
+    description: Seconds to wait before each deploy retry
+    required: false
+    default: "60"
   rebuild:
     description: Rebuild and redeploy the current app source (ps:rebuild)
     required: false

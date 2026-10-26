@@ -8,8 +8,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -19,3 +19,72 @@ jobs:
         run: git diff --exit-code -- dist
       - name: shellcheck
         run: shellcheck -x -e SC1091 install uninstall commands post-deploy bin/dokku-api subcommands/*
+
+  # The action against the real daemon (with the fake dokku binary), signed in
+  # with a real GitHub OIDC token: proves issuer, keys, claims and audience
+  # match what GitHub actually sends.
+  e2e:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      DOKKU_API_DB: /tmp/dokku-api/api.db
+      FAKE_DOKKU_LOG: /tmp/dokku-api/dokku.log
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Start the daemon and trust this workflow
+        run: |
+          export DOKKU_API_DOKKU_BIN="$PWD/test/fake-dokku.mjs"
+          bin/dokku-api cli set oidc-audience http://127.0.0.1:5099
+          bin/dokku-api cli trust-github "$GITHUB_REPOSITORY" --workflow ci.yml --app 'shop-*' --scope deploy,read
+          nohup bin/dokku-api daemon > /tmp/dokku-api/daemon.log 2>&1 &
+          for _ in $(seq 30); do curl -sf http://127.0.0.1:5099/health && exit 0; sleep 1; done
+          cat /tmp/dokku-api/daemon.log
+          exit 1
+      - name: Deploy without a secret
+        uses: ./
+        with:
+          dokku_url: http://127.0.0.1:5099
+          app_name: shop-api
+          deploy_repository: https://github.com/${{ github.repository }}.git
+          deploy_ref: ${{ github.sha }}
+      - name: A failing deploy is retried
+        id: retried
+        continue-on-error: true
+        uses: ./
+        with:
+          dokku_url: http://127.0.0.1:5099
+          app_name: shop-api
+          deploy_image: broken:image
+          deploy_retries: 1
+          deploy_retry_delay: 1
+      - name: An app outside the trust is refused
+        id: refused
+        continue-on-error: true
+        uses: ./
+        with:
+          dokku_url: http://127.0.0.1:5099
+          app_name: other
+          rebuild: true
+      - name: Check what reached dokku
+        env:
+          RETRIED: ${{ steps.retried.outcome }}
+          REFUSED: ${{ steps.refused.outcome }}
+        run: |
+          cat "$FAKE_DOKKU_LOG"
+          fail() { echo "::error::$1"; exit 1; }
+          grep -qxF "[\"git:sync\",\"--build\",\"shop-api\",\"https://github.com/$GITHUB_REPOSITORY.git\",\"$GITHUB_SHA\"]" "$FAKE_DOKKU_LOG" \
+            || fail "the OIDC deploy did not reach dokku"
+          [ "$(grep -c 'broken:image' "$FAKE_DOKKU_LOG")" = 2 ] || fail "the failing deploy was not tried exactly twice"
+          if grep -q '"other"' "$FAKE_DOKKU_LOG"; then fail "an app outside the trust reached dokku"; fi
+          [ "$RETRIED" = failure ] || fail "the failing deploy did not fail the step"
+          [ "$REFUSED" = failure ] || fail "the app outside the trust was not refused"
+          bin/dokku-api cli trust-list
+          bin/dokku-api cli audit
+      - name: Daemon log
+        if: always()
+        run: cat /tmp/dokku-api/daemon.log

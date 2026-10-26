@@ -3,8 +3,9 @@ import { authorizeCli } from "./allowlist.js";
 import { Store } from "./db.js";
 import { runDokku } from "./dokku.js";
 import { HttpError, isPlainObject, parseBool, readJsonBody, sendJson, sendProblem } from "./http.js";
+import { authenticateGithub, AuthError, looksLikeJwt } from "./oidc.js";
 import { APP_NAME_RE, globMatch } from "./scopes.js";
-export const VERSION = "0.1.0";
+export const VERSION = "1.0.0";
 const PROCESS_RE = /^[a-z0-9][a-z0-9_-]*$/;
 const CONFIG_KEY_RE = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
 const IMAGE_RE = /^[^\s-][^\s]*$/;
@@ -114,13 +115,26 @@ const routes = [
     {
         method: "GET",
         pattern: /^\/api\/v1\/me$/,
-        handler: async (ctx) => ({
-            name: ctx.token.name,
-            token_prefix: ctx.token.token_prefix,
-            created_at: ctx.token.created_at,
-            expires_at: ctx.token.expires_at,
-            permissions: ctx.store.listPermissions(ctx.token.id).map((p) => ({ app_pattern: p.app_pattern, scope: p.scope })),
-        }),
+        handler: async (ctx) => {
+            const trust = ctx.token.kind === "github" ? ctx.store.getGithubTrust(ctx.token.id) : undefined;
+            return {
+                name: ctx.token.name,
+                kind: ctx.token.kind,
+                ...(trust
+                    ? {
+                        github: {
+                            repository: trust.repository,
+                            environment: trust.environment,
+                            ref: trust.ref_pattern,
+                            workflow: trust.workflow,
+                        },
+                    }
+                    : { token_prefix: ctx.token.token_prefix }),
+                created_at: ctx.token.created_at,
+                expires_at: ctx.token.expires_at,
+                permissions: ctx.store.listPermissions(ctx.token.id).map((p) => ({ app_pattern: p.app_pattern, scope: p.scope })),
+            };
+        },
     },
     {
         method: "GET",
@@ -369,13 +383,29 @@ async function setConfig(ctx, vars) {
     return { name, keys: entries.map(([k]) => k), restarted: restart, execution: result };
 }
 // --- server ----------------------------------------------------------------
-function authenticate(store, req) {
+async function authenticate(store, req) {
     const header = req.headers.authorization ?? "";
     const match = /^Bearer\s+(\S+)$/i.exec(header);
     const challenge = { "WWW-Authenticate": 'Bearer realm="dokku-api"' };
     if (!match)
         throw new HttpError(401, "Unauthorized", "missing bearer token", {}, challenge);
-    const token = store.findTokenBySecret(match[1]);
+    const secret = match[1];
+    // API tokens never contain dots; a JWT is a GitHub Actions OIDC token.
+    if (looksLikeJwt(secret)) {
+        const audience = store.getSetting("oidc-audience");
+        if (!audience) {
+            throw new HttpError(401, "Unauthorized", 'GitHub OIDC is not set up on this server (run "dokku api:setup --domain <domain>")', {}, challenge);
+        }
+        try {
+            return await authenticateGithub(store, secret, audience);
+        }
+        catch (err) {
+            if (err instanceof AuthError)
+                throw new HttpError(401, "Unauthorized", err.message, {}, challenge);
+            throw err;
+        }
+    }
+    const token = store.findTokenBySecret(secret);
     if (!token || token.revoked)
         throw new HttpError(401, "Unauthorized", "invalid or revoked token", {}, challenge);
     if (token.expires_at && Date.parse(token.expires_at) <= Date.now()) {
@@ -410,7 +440,7 @@ export function createApiServer(store) {
                 const allow = [...new Set(candidates.map((c) => c.route.method))].join(", ");
                 throw new HttpError(405, "Method Not Allowed", `use ${allow}`, {}, { Allow: allow });
             }
-            token = authenticate(store, req);
+            token = await authenticate(store, req);
             store.touchToken(token.id);
             const params = {};
             try {
