@@ -416,7 +416,7 @@ For service plugins (`postgres:*`, `redis:*`, …), `app` is the first positiona
 
 ## GitHub Action
 
-Without `api_token`, the action signs in as the workflow run via OIDC. That needs `id-token: write` in the job's permissions and a matching [`dokku api:trust-github`](#github-actions-without-secrets-oidc) on the server.
+Releases are tagged `vX.Y.Z`; `@v1` always points to the latest 1.x release. Without `api_token`, the action signs in as the workflow run via OIDC. That needs `id-token: write` in the job's permissions and a matching [`dokku api:trust-github`](#github-actions-without-secrets-oidc) on the server.
 
 ```yaml
 name: Deploy
@@ -549,7 +549,7 @@ Settings stored in the database are changed with `dokku api:set <key> [<value>]`
 ## Updating and uninstalling
 
 ```sh
-# Update, then re-run the install hook (migrates the database and restarts the daemon)
+# Update to the latest main, then re-run the install hook (migrates the database and restarts the daemon)
 sudo dokku plugin:update api
 sudo dokku plugin:install
 

@@ -72,4 +72,5 @@ CI (`.github/workflows/ci.yml`) runs the tests, fails if `dist/` differs from a 
 - New REST endpoints: add them to the `routes` array in `src/server.ts`, add tests, and document them in the README endpoint table.
 - Bash: Dokku style (`source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"`, `set -eo pipefail`, `dokku_log_*`), and it must pass shellcheck.
 - The version lives in three places, keep them in sync: `package.json`, `plugin.toml`, and `VERSION` in `src/server.ts`.
+- Releasing: bump the version (semver) and merge to `main`. After CI passes there, `.github/workflows/release.yml` tags `v<version>`, moves the major tag (`v1`) that workflows `uses:`, and publishes a GitHub release. Never move a major tag to a breaking change; that needs a new major version.
 - Code, comments, commits and docs are in English.
