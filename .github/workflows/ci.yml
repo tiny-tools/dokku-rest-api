@@ -88,3 +88,32 @@ jobs:
       - name: Daemon log
         if: always()
         run: cat /tmp/dokku-api/daemon.log
+
+  # On main, after both jobs pass: if package.json has a version without a tag
+  # yet, tag the commit v<version>, move the major tag (v1) that `uses:`
+  # refers to, and publish a GitHub release. Bump the version (package.json,
+  # plugin.toml, VERSION in src/server.ts) to release; other pushes do nothing.
+  release:
+    needs: [test, e2e]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          tag="v$version"
+          major="v${version%%.*}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "$tag already exists, nothing to release"
+            exit 0
+          fi
+          git tag "$tag" "$GITHUB_SHA"
+          git push origin "refs/tags/$tag"
+          git tag -f "$major" "$GITHUB_SHA"
+          git push -f origin "refs/tags/$major"
+          gh release create "$tag" --verify-tag --title "$tag" --generate-notes --latest
