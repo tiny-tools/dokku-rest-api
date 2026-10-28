@@ -17,6 +17,10 @@ jobs:
       - run: npm test
       - name: dist/ is up to date
         run: git diff --exit-code -- dist
+      - name: CHANGELOG.md describes this version
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          grep -qxF "## $version" CHANGELOG.md || { echo "::error::CHANGELOG.md has no '## $version' section"; exit 1; }
       - name: shellcheck
         run: shellcheck -x -e SC1091 install uninstall update commands post-deploy bin/dokku-api bin/dokku-api-certbot subcommands/*
 
@@ -114,8 +118,15 @@ jobs:
             echo "$tag already exists, nothing to release"
             exit 0
           fi
+          # Release notes: this version's section of CHANGELOG.md.
+          awk -v heading="## $version" '$0 == heading { found = 1; next } found && /^## / { exit } found { print }' \
+            CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          if [ ! -s "$RUNNER_TEMP/notes.md" ]; then
+            echo "::error::CHANGELOG.md has no notes for $version"
+            exit 1
+          fi
           git tag "$tag" "$GITHUB_SHA"
           git push origin "refs/tags/$tag"
           git tag -f "$major" "$GITHUB_SHA"
           git push -f origin "refs/tags/$major"
-          gh release create "$tag" --verify-tag --title "$tag" --generate-notes --latest
+          gh release create "$tag" --verify-tag --title "$tag" --notes-file "$RUNNER_TEMP/notes.md" --latest

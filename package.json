@@ -1,6 +1,6 @@
 {
   "name": "dokku-rest-api",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Dokku plugin exposing a token-scoped REST API and an allow-listed 1:1 CLI bridge, plus a GitHub Action",
   "license": "MIT",
   "private": true,
