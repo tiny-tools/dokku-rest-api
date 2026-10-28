@@ -5,7 +5,7 @@ import { runDokku } from "./dokku.js";
 import { HttpError, isPlainObject, parseBool, readJsonBody, sendJson, sendProblem } from "./http.js";
 import { authenticateGithub, AuthError, looksLikeJwt } from "./oidc.js";
 import { APP_NAME_RE, globMatch } from "./scopes.js";
-export const VERSION = "1.1.0";
+export const VERSION = "1.2.0";
 const PROCESS_RE = /^[a-z0-9][a-z0-9_-]*$/;
 const CONFIG_KEY_RE = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
 const IMAGE_RE = /^[^\s-][^\s]*$/;

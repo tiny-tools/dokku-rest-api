@@ -74,11 +74,65 @@ test("withRetries retries dokku and server failures only", async () => {
     assert.equal(once.calls(), 1, err.message);
   }
 
-  const network = failing([new TypeError("fetch failed")]);
+  const network = failing([Object.assign(new Error("socket hang up"), { code: "ECONNRESET" })]);
   assert.equal(await withRetries(network.fn, 1, 0, undefined, sleep), "ok");
   assert.equal(network.calls(), 2);
 
   const none = failing([new ApiError("a", {}, 422)]);
   await assert.rejects(withRetries(none.fn, 0, 0, undefined, sleep));
   assert.equal(none.calls(), 1);
+});
+
+async function serve(handler) {
+  const { createServer } = await import("node:http");
+  const server = createServer(handler);
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  return { url: `http://127.0.0.1:${server.address().port}`, close: () => server.close() };
+}
+
+test("httpExchange waits for late headers up to its own timeout", async () => {
+  const { httpExchange, isRetryable } = await import("../dist/action/lib.js");
+  // Response headers only after 1.5 s, like a synchronous deploy (fetch gives up after 300 s).
+  const slow = await serve((req, res) => setTimeout(() => res.writeHead(200).end("done"), 1500));
+  try {
+    const ok = await httpExchange(new URL(slow.url), { method: "POST", headers: {}, body: "{}", timeoutMs: 5000 });
+    assert.deepEqual(ok, { status: 200, text: "done" });
+    await assert.rejects(httpExchange(new URL(slow.url), { method: "GET", headers: {}, timeoutMs: 300 }), (err) => {
+      assert.equal(err.name, "TimeoutError");
+      assert.equal(isRetryable(err), false);
+      return true;
+    });
+  } finally {
+    slow.close();
+  }
+  const closed = await serve(() => {});
+  closed.close();
+  await new Promise((r) => setTimeout(r, 50));
+  await assert.rejects(httpExchange(new URL(closed.url), { method: "GET", headers: {}, timeoutMs: 1000 }), (err) => {
+    assert.equal(err.code, "ECONNREFUSED");
+    assert.equal(isRetryable(err), true);
+    return true;
+  });
+});
+
+test("waitForHealthy polls until the app answers with the expected content", async () => {
+  const { waitForHealthy } = await import("../dist/action/lib.js");
+  let hits = 0;
+  const app = await serve((req, res) => {
+    hits++;
+    if (hits < 3) return res.writeHead(503).end("starting");
+    res.writeHead(200).end('{"version":"abc123"}');
+  });
+  const lines = [];
+  const noSleep = async () => {};
+  try {
+    assert.equal(await waitForHealthy(`${app.url}/version`, { contains: "abc123", timeoutMs: 10_000, log: (l) => lines.push(l) }, noSleep), 3);
+    assert.deepEqual(lines, ["attempt 1: HTTP 503", "attempt 2: HTTP 503"]);
+    await assert.rejects(
+      waitForHealthy(app.url, { contains: "def456", timeoutMs: 300, intervalMs: 50 }),
+      /failed after \d+ attempt\(s\): response does not contain "def456"/,
+    );
+  } finally {
+    app.close();
+  }
 });

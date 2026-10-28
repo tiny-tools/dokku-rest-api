@@ -1,6 +1,7 @@
 // Host-side administration, invoked through `dokku api:<command>`.
 import { parseArgs, type ParseArgsOptionsConfig } from "node:util";
 import { Store } from "./db.js";
+import { VERSION } from "./server.js";
 import { APP_PATTERN_RE, expandScopes, isScope, SCOPE_ALIASES, SCOPES } from "./scopes.js";
 
 const SETTINGS = {
@@ -140,12 +141,15 @@ async function report(store: Store): Promise<string> {
     const res = await fetch(`http://${host}:${port}/api/v1/health`, { signal: AbortSignal.timeout(2000) });
     const body = (await res.json()) as { status?: string; version?: string };
     daemon = `${body.status} (version ${body.version})`;
+    // The daemon keeps running old code until it is restarted.
+    if (body.version !== VERSION) daemon += `, restart it: sudo systemctl restart dokku-api`;
   } catch {
     /* keep "not reachable" */
   }
   const tokens = store.listTokens();
   const lines = [
     `=====> api report`,
+    `       Plugin version:    ${VERSION}`,
     `       Daemon:            ${daemon} on http://${host}:${port}`,
     `       Database:          ${process.env.DOKKU_API_DB || "/var/lib/dokku/data/api/storage.db"}`,
     `       Active tokens:     ${tokens.filter((t) => !t.revoked && t.kind === "token").length} (${tokens.filter((t) => t.kind === "token").length} total)`,

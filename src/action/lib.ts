@@ -2,6 +2,8 @@
 // inputs come from INPUT_* env vars and outputs go to $GITHUB_OUTPUT.
 import { appendFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 
 function input(name: string, fallback = ""): string {
   return (process.env[`INPUT_${name.toUpperCase()}`] ?? fallback).trim() || fallback;
@@ -52,7 +54,45 @@ export class ApiError extends Error {
 export function isRetryable(err: unknown): boolean {
   if (err instanceof ApiError) return err.status === 422 || err.status >= 500;
   if (err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError")) return false;
-  return err instanceof TypeError; // fetch's network errors
+  const code = (err as { code?: unknown } | null)?.code;
+  return typeof code === "string" && NETWORK_ERRORS.has(code);
+}
+
+const NETWORK_ERRORS = new Set(["ECONNRESET", "ECONNREFUSED", "EPIPE", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "EAI_AGAIN"]);
+
+// One HTTP request with a single deadline for the whole exchange. Not fetch:
+// undici gives up after 300 s without response headers, whatever the signal
+// says, and a synchronous deploy sends its headers only when the build is done.
+export function httpExchange(
+  url: URL,
+  options: { method: string; headers: Record<string, string>; body?: string; timeoutMs: number },
+): Promise<{ status: number; text: string }> {
+  return new Promise((resolve, reject) => {
+    const send = url.protocol === "https:" ? httpsRequest : url.protocol === "http:" ? httpRequest : undefined;
+    if (!send) return reject(new Error(`unsupported URL ${url.href}`));
+    const req = send(url, { method: options.method, headers: options.headers }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (chunk: Buffer) => chunks.push(chunk));
+      res.on("end", () => {
+        clearTimeout(timer);
+        resolve({ status: res.statusCode ?? 0, text: Buffer.concat(chunks).toString("utf8") });
+      });
+      res.on("error", fail);
+    });
+    function fail(err: Error) {
+      clearTimeout(timer);
+      reject(err);
+    }
+    const timer = setTimeout(() => {
+      const err = new Error(`no complete response within ${Math.round(options.timeoutMs / 1000)} s`);
+      err.name = "TimeoutError";
+      req.destroy(err);
+    }, options.timeoutMs);
+    req.on("error", fail);
+    // A build can keep the connection silent for many minutes.
+    req.on("socket", (socket) => socket.setKeepAlive(true, 30_000));
+    req.end(options.body);
+  });
 }
 
 export async function withRetries<T>(
@@ -110,7 +150,7 @@ export class Client {
   ) {}
 
   async request(method: string, path: string, body?: unknown): Promise<Record<string, unknown>> {
-    const res = await fetch(`${this.baseUrl}/api/v1${path}`, {
+    const res = await httpExchange(new URL(`${this.baseUrl}/api/v1${path}`), {
       method,
       headers: {
         Authorization: `Bearer ${await this.token()}`,
@@ -119,20 +159,52 @@ export class Client {
         "User-Agent": "dokku-api-action",
       },
       body: body === undefined ? undefined : JSON.stringify(body),
-      signal: AbortSignal.timeout(this.timeoutMs),
+      timeoutMs: this.timeoutMs,
     });
-    const text = await res.text();
+    const text = res.text;
     let parsed: Record<string, unknown>;
     try {
       parsed = text ? (JSON.parse(text) as Record<string, unknown>) : {};
     } catch {
       parsed = { raw: text };
     }
-    if (!res.ok) {
+    if (res.status < 200 || res.status >= 300) {
       const detail = [parsed.title, parsed.detail].filter(Boolean).join(": ") || text.slice(0, 500);
       throw new ApiError(`${method} ${path} failed with HTTP ${res.status}: ${detail}`, parsed, res.status);
     }
     return parsed;
+  }
+}
+
+// Polls `url` until it answers 2xx (and its body contains `contains`, if
+// given) or `timeoutMs` passes. Returns the number of attempts.
+export async function waitForHealthy(
+  url: string,
+  options: { contains?: string; timeoutMs: number; intervalMs?: number; log?: (line: string) => void },
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+): Promise<number> {
+  const target = new URL(url);
+  const deadline = Date.now() + options.timeoutMs;
+  const log = options.log ?? (() => {});
+  for (let attempt = 1; ; attempt++) {
+    let problem: string;
+    try {
+      const res = await httpExchange(target, {
+        method: "GET",
+        headers: { Accept: "*/*", "User-Agent": "dokku-api-action" },
+        timeoutMs: Math.max(1000, Math.min(10_000, deadline - Date.now())),
+      });
+      const healthy = res.status >= 200 && res.status < 300;
+      if (healthy && (!options.contains || res.text.includes(options.contains))) return attempt;
+      problem = healthy ? `response does not contain "${options.contains}"` : `HTTP ${res.status}`;
+    } catch (err) {
+      problem = err instanceof Error ? err.message : String(err);
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`health check of ${url} failed after ${attempt} attempt(s): ${problem}`);
+    }
+    log(`attempt ${attempt}: ${problem}`);
+    await sleep(options.intervalMs ?? 5000);
   }
 }
 
@@ -295,6 +367,22 @@ export async function run(): Promise<void> {
     } catch (err) {
       if (err instanceof ApiError) printExecution(err.body as Execution);
       throw err;
+    } finally {
+      endGroup();
+    }
+  }
+
+  // Optional: wait until the app answers on its own URL. Not every app has a
+  // health endpoint, so nothing happens without health_check_url.
+  const healthUrl = input("health_check_url");
+  if (healthUrl) {
+    const contains = input("health_check_contains");
+    const timeoutSeconds = intInput("health_check_timeout", 120);
+    group(`Health check ${healthUrl}${contains ? ` (expecting "${contains}")` : ""}`);
+    try {
+      const attempts = await waitForHealthy(healthUrl, { contains, timeoutMs: timeoutSeconds * 1000, log: (l) => console.log(l) });
+      console.log(`healthy after ${attempts} attempt(s)`);
+      results.push({ step: "health_check", url: healthUrl, attempts });
     } finally {
       endGroup();
     }
