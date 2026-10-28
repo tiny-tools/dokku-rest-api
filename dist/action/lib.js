@@ -241,7 +241,7 @@ export async function run() {
         const restartAfterConfig = boolInput("config_restart", true) && !deploying;
         group(`Set config: ${Object.keys(vars).join(", ")}`);
         const res = await client.request("PATCH", `${appPath}/config?restart=${restartAfterConfig}`, vars);
-        printExecution(res.execution);
+        printExecution((res.execution ?? res));
         results.push({ step: "config", keys: res.keys });
         endGroup();
     }
@@ -266,7 +266,7 @@ export async function run() {
         const formation = parseScale(scale);
         group(`Scale ${Object.entries(formation).map(([k, v]) => `${k}=${v}`).join(" ")}`);
         const res = await client.request("PATCH", `${appPath}/formation`, formation);
-        printExecution(res.execution);
+        printExecution((res.execution ?? res));
         results.push({ step: "scale", formation: res.formation });
         endGroup();
     }

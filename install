@@ -9,6 +9,8 @@ DATA_DIR="/var/lib/dokku/data/api"
 ENV_FILE="/etc/default/dokku-api"
 UNIT_FILE="/etc/systemd/system/dokku-api.service"
 NGINX_INCLUDE="/etc/nginx/conf.d/dokku-api.conf"
+CERTBOT_HELPER="/usr/local/sbin/dokku-api-certbot"
+SUDOERS_FILE="/etc/sudoers.d/dokku-api"
 SYSTEM_USER="${DOKKU_SYSTEM_USER:-dokku}"
 SYSTEM_GROUP="${DOKKU_SYSTEM_GROUP:-dokku}"
 
@@ -52,6 +54,20 @@ ENV
     echo "include $DATA_DIR/nginx/*.conf;" >"$NGINX_INCLUDE"
   fi
 
+  # `api:setup --letsencrypt` runs as the dokku user but certbot needs root:
+  # a root-owned copy of the helper (validates its arguments) and a sudo rule
+  # for exactly that file.
+  install -o root -g root -m 755 "$PLUGIN_DIR/bin/dokku-api-certbot" "$CERTBOT_HELPER"
+  local sudoers_tmp
+  sudoers_tmp="$(mktemp)"
+  echo "$SYSTEM_USER ALL=(root) NOPASSWD: $CERTBOT_HELPER" >"$sudoers_tmp"
+  if visudo -cf "$sudoers_tmp" >/dev/null; then
+    install -o root -g root -m 440 "$sudoers_tmp" "$SUDOERS_FILE"
+  else
+    dokku_log_warn "Could not validate the sudo rule for $CERTBOT_HELPER; api:setup --letsencrypt will not work"
+  fi
+  rm -f "$sudoers_tmp"
+
   if command -v systemctl >/dev/null && [[ -d /run/systemd/system ]]; then
     cat >"$UNIT_FILE" <<UNIT
 [Unit]
@@ -79,7 +95,7 @@ UNIT
     dokku_log_warn "systemd not found; start the daemon yourself: sudo -u $SYSTEM_USER $PLUGIN_DIR/bin/dokku-api daemon"
   fi
 
-  dokku_log_info2 "Next: dokku api:setup --domain api.example.com && dokku api:token-create <name> --app <app> --scope readonly"
+  dokku_log_info2 "Next: dokku api:setup --domain api.example.com --letsencrypt"
 }
 
 plugin-install "$@"

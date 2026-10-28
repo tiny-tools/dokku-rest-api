@@ -45,6 +45,9 @@ switch (command) {
     }
     out(`-----> Deploying ${positionals[1]}\n`);
     break;
+  case "ps:rebuild":
+    out("-----> Building\nstep 1\nstep 2\nstep 3\n=====> Application deployed\n");
+    break;
   default:
     out(`ran ${argv.join(" ")}\n`);
 }

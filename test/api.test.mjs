@@ -161,6 +161,14 @@ describe("formation", () => {
     assert.deepEqual(calls()[0], ["ps:scale", "--skip-deploy", "shop-api", "web=3", "worker=0"]);
   });
 
+  test("the result has the same top-level fields as other commands", async () => {
+    const res = await api("PATCH", "/api/v1/apps/shop-api/formation", { token: tokens.writer, body: { web: 1 } });
+    assert.equal(res.body.ok, true);
+    assert.equal(res.body.exit_code, 0);
+    assert.equal(res.body.command_executed, "dokku ps:scale shop-api web=1");
+    assert.deepEqual(res.body.execution.stdout, res.body.stdout);
+  });
+
   test("invalid quantities are rejected", async () => {
     for (const body of [{ web: -1 }, { web: "2; rm -rf /" }, { "web;x": 1 }, {}]) {
       const res = await api("PATCH", "/api/v1/apps/shop-api/formation", { token: tokens.writer, body });
@@ -196,6 +204,13 @@ describe("config", () => {
     const [argv] = calls();
     assert.deepEqual(argv.slice(0, 4), ["config:set", "--encoded", "--no-restart", "shop-api"]);
     assert.equal(Buffer.from(argv[4].split("=")[1], "base64").toString(), value);
+  });
+
+  test("the result has the same top-level fields as other commands", async () => {
+    const res = await api("PATCH", "/api/v1/apps/shop-api/config", { token: tokens.writer, body: { A: "1" } });
+    assert.equal(res.body.ok, true);
+    assert.equal(res.body.command_executed, "dokku config:set …");
+    assert.equal(res.body.execution.ok, true);
   });
 
   test("put a single value", async () => {
@@ -248,6 +263,31 @@ describe("logs, restart, deploy", () => {
       ["git:sync", "--build", "shop-api", "https://github.com/a/b.git", "main"],
       ["ps:rebuild", "shop-api"],
     ]);
+  });
+
+  test("log_tail shortens the returned output", async () => {
+    const full = await api("POST", "/api/v1/apps/shop-api/deploys", { token: tokens.writer });
+    assert.equal(full.body.stdout.split("\n").length, 6);
+    assert.equal(full.body.truncated, undefined);
+
+    const tail = await api("POST", "/api/v1/apps/shop-api/deploys?log_tail=2", { token: tokens.writer });
+    assert.equal(tail.status, 200);
+    assert.equal(tail.body.stdout, "step 3\n=====> Application deployed\n");
+    assert.equal(tail.body.truncated, true);
+    assert.equal(tail.body.ok, true);
+
+    const failed = await api("POST", "/api/v1/apps/shop-api/deploys?log_tail=0", { token: tokens.writer, body: { image: "broken:image" } });
+    assert.equal(failed.status, 422);
+    assert.equal(failed.body.stderr, "");
+    assert.equal(failed.body.truncated, true);
+  });
+
+  test("an invalid log_tail is refused before dokku runs", async () => {
+    for (const value of ["abc", "-1", "1.5", "100001"]) {
+      const res = await api("POST", `/api/v1/apps/shop-api/deploys?log_tail=${value}`, { token: tokens.writer });
+      assert.equal(res.status, 400, value);
+    }
+    assert.equal(calls().length, 0);
   });
 
   test("local repositories and flag-like images are rejected", async () => {
@@ -347,6 +387,20 @@ describe("admin cli", () => {
     assert.deepEqual(scopes, ["config:read", "config:write", "deploy", "logs", "read", "restart", "scale"]);
     await assert.rejects(adminRun("token-create", "alias"), /already exists/);
     await assert.rejects(adminRun("perm-add", "alias", "--app", "x", "--scope", "delete"), /unknown scope/);
+  });
+
+  test("token-create can print only the token or JSON", async () => {
+    const quiet = await adminRun("token-create", "quiet", "--app", "x", "--scope", "read", "--quiet");
+    assert.match(quiet, /^dk_live_[A-Za-z0-9_-]{43}$/);
+    const json = JSON.parse(await adminRun("token-create", "json", "--app", "x", "--scope", "deploy", "--expires-in", "1d", "--format", "json"));
+    assert.equal(json.name, "json");
+    assert.match(json.token, /^dk_live_/);
+    assert.ok(Date.parse(json.expires_at) > Date.now());
+    assert.deepEqual(json.permissions, [{ app_pattern: "x", scope: "deploy" }]);
+    const me = await api("GET", "/api/v1/me", { token: json.token });
+    assert.equal(me.body.name, "json");
+    await assert.rejects(adminRun("token-create", "bad", "--format", "yaml"), /json/);
+    await assert.rejects(adminRun("token-create", "bad", "--quiet", "--format", "json"), /either/);
   });
 
   test("token secrets are stored hashed", async () => {

@@ -73,8 +73,9 @@ Deliberately left out for now: destroying apps and unsetting environment variabl
 ## Requirements
 
 - A recent Dokku release. The API reads `--format json` output from `apps:list`, `ps:scale` and the `*:report` commands.
-- **Node.js 22.13 or newer** on the Dokku host, for example from [NodeSource](https://github.com/nodesource/distributions)
+- **Node.js 22.13 or newer** on the Dokku host. On Ubuntu 26.04, `apt install nodejs` is enough; on older releases use e.g. [NodeSource](https://github.com/nodesource/distributions)
 - systemd (for the bundled service unit) and nginx (Dokku's default proxy)
+- For `api:setup --letsencrypt`: certbot (`apt install certbot`)
 
 ## Quick start
 
@@ -82,8 +83,9 @@ Deliberately left out for now: destroying apps and unsetting environment variabl
 # 1. On the Dokku host: install the plugin (as root)
 sudo dokku plugin:install https://github.com/tiny-tools/dokku-rest-api.git --name api
 
-# 2. Expose the API on a domain, with TLS (see "Exposing the API with TLS")
-dokku api:setup --domain api.dokku.example.com --ssl-cert … --ssl-key …
+# 2. Expose the API on a domain, with a Let's Encrypt certificate
+#    (the domain must already point to this server)
+dokku api:setup --domain api.dokku.example.com --letsencrypt --email ops@example.com
 
 # 3. Let the GitHub Actions of a repository deploy one app
 dokku api:trust-github my-org/shop-api --app shop-api --scope deploy
@@ -106,7 +108,7 @@ jobs:
           deploy_ref: ${{ github.sha }}
 ```
 
-No secret is stored anywhere. For access from outside GitHub Actions, create an [API token](#managing-tokens) instead:
+No secret is stored anywhere. For a private repository, the server also needs read access to it, see [Private repositories](#private-repositories). For access from outside GitHub Actions, create an [API token](#managing-tokens) instead:
 
 ```sh
 dokku api:token-create dashboard --app shop-api --scope readonly --expires-in 90d
@@ -122,6 +124,8 @@ sudo dokku plugin:install https://github.com/tiny-tools/dokku-rest-api.git --nam
 
 `--name api` is required. Without it Dokku names the plugin `rest-api`, and the commands would not be available as `dokku api:*`.
 
+`plugin:install` runs the install trigger of **every** installed plugin, not only this one, so expect a lot of output. That is Dokku's normal behaviour.
+
 The install hook:
 
 1. checks for Node.js 22.13 or newer
@@ -129,26 +133,29 @@ The install hook:
 3. writes `/etc/default/dokku-api` (only if it doesn't exist yet)
 4. creates or migrates the SQLite database and seeds the default allow-list
 5. adds `/etc/nginx/conf.d/dokku-api.conf`, which includes the config written by `api:setup`
-6. installs, enables and (re)starts `dokku-api.service`, which runs as the `dokku` user on `127.0.0.1:5099`
+6. installs the certbot helper for `api:setup --letsencrypt` as `/usr/local/sbin/dokku-api-certbot` (root-owned) and a sudo rule that lets the `dokku` user run exactly that file (`/etc/sudoers.d/dokku-api`)
+7. installs, enables and (re)starts `dokku-api.service`, which runs as the `dokku` user on `127.0.0.1:5099`
 
 ### Exposing the API with TLS
 
 ```sh
-dokku api:setup --domain api.dokku.example.com
+dokku api:setup --domain api.dokku.example.com --letsencrypt [--email ops@example.com]
 ```
 
-Without TLS, tokens travel in plain text. For Let's Encrypt, the challenge directory is already served, so `certbot`'s webroot mode works:
+This serves the domain over HTTP, obtains a certificate with certbot (webroot mode, through `/var/lib/dokku/data/api/acme`), and switches to HTTPS with a redirect from HTTP. certbot's own timer renews the certificate and reloads nginx afterwards. The domain must already point to this server and port 80 must be reachable. Running the command again for the same domain keeps the certificate and never drops TLS in between.
+
+**Changing the domain:** run `api:setup` with the new domain. Add `--delete-old-cert` to delete the certificate of the old domain; otherwise it stays and keeps being renewed, and `api:setup` prints the command to delete it. Only certificates that `api:setup --letsencrypt` obtained can be deleted this way.
+
+**Your own certificate:**
 
 ```sh
-sudo certbot certonly --webroot -w /var/lib/dokku/data/api/acme \
-  -d api.dokku.example.com --deploy-hook 'systemctl reload nginx'
-
 dokku api:setup --domain api.dokku.example.com \
-  --ssl-cert /etc/letsencrypt/live/api.dokku.example.com/fullchain.pem \
-  --ssl-key  /etc/letsencrypt/live/api.dokku.example.com/privkey.pem
+  --ssl-cert /etc/ssl/api/fullchain.pem --ssl-key /etc/ssl/api/privkey.pem
 ```
 
-`api:setup` validates the generated config with `nginx -t` and restores the previous version if nginx rejects it. It also stores the API's URL (`https://<domain>`) as the `oidc-audience` setting, which [GitHub trusts](#github-actions-without-secrets-oidc) need.
+Without any of these options the API is served over plain HTTP, and tokens travel in plain text.
+
+`api:setup` stops with "File not found" when it can tell that a certificate file is missing. For paths it cannot look into (`/etc/letsencrypt/live` is root-only), nginx decides: the config is validated with `nginx -t`, nginx's error is shown, and the previous config is restored. It also stores the API's URL (`https://<domain>`) as the `oidc-audience` setting, which [GitHub trusts](#github-actions-without-secrets-oidc) need.
 
 **Behind Cloudflare or another proxy:** deploys run as one long request (often several minutes). Cloudflare's proxy cuts requests after 100 seconds, so point the API's hostname at the server directly (DNS only, no proxy).
 
@@ -224,6 +231,11 @@ dokku api:perm-add dashboard --app shop-api --scope read
 dokku api:perm-remove dashboard --app shop-api --scope read
 dokku api:perm-list [<token>]
 
+# Print only the token, or JSON, e.g. to put it straight into a secret store
+dokku api:token-create ci --app shop-api --scope deploy --quiet | gh secret set DOKKU_API_TOKEN
+dokku api:token-create ci2 --app shop-api --scope deploy --format json
+#    → {"name":"ci2","token":"dk_live_…","expires_at":null,"permissions":[{"app_pattern":"shop-api","scope":"deploy"}]}
+
 dokku api:token-list
 dokku api:token-revoke github-prod      # takes effect immediately
 dokku api:audit --limit 20              # recent requests
@@ -266,6 +278,24 @@ App patterns are exact names, globs with `*` (`staging-*`), or `*` for all apps.
 | `404`  | unknown route, app or config key |
 | `422`  | the Dokku command ran but exited non-zero; the body has `exit_code`, `stdout` and `stderr` |
 | `504`  | the Dokku command hit the execution timeout |
+
+### Response format
+
+Every endpoint that runs a Dokku command to change something (deploys, restart/start/stop, formation, config, the CLI bridge) returns the command's result as top-level fields, next to its own fields:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `ok` | boolean | the command exited with 0 |
+| `exit_code` | number | the command's exit code |
+| `command_executed` | string | the command line; redacted for `config:set` (`dokku config:set …`) |
+| `stdout`, `stderr` | string | the command's output (ANSI colours removed, at most 4 MB each) |
+| `duration_ms` | number | runtime |
+| `timed_out` | boolean | the command hit `DOKKU_API_EXEC_TIMEOUT_MS` |
+| `truncated` | boolean | only with `?log_tail`: whether lines were left out |
+
+Failures (`422`, `504`) carry the same fields in the problem+json body. `PATCH …/formation` and `…/config` additionally return them under `execution`, as in 1.0; that duplicate goes away in 2.0.
+
+**`?log_tail=N`** on any of these endpoints returns only the last `N` lines of `stdout` and `stderr`. A deploy's full build log can be several hundred KB; `?log_tail=200` keeps the part that matters. `N` is checked before the command runs.
 
 ### Endpoints
 
@@ -339,7 +369,34 @@ curl -s "$API/apps/shop-api/logs?lines=200&process=web" -H "$AUTH"
 
 Config values are base64-encoded and passed with `config:set --encoded`, so spaces, quotes and newlines are safe. The echoed command is redacted, so values never show up in CI logs.
 
-Deploys run synchronously. A request can take several minutes, so set your client's timeout to match (the GitHub Action defaults to 900 seconds).
+Deploys run synchronously. A request can take several minutes, so set your client's timeout to match (the GitHub Action defaults to 900 seconds), and use `?log_tail=` to keep the response small.
+
+```sh
+# Build a commit from source; Dokku sets GIT_REV to the SHA
+curl -s -X POST "$API/apps/shop-api/deploys?log_tail=50" -H "$AUTH" \
+  -H 'Content-Type: application/json' \
+  -d '{"repository": "git@github.com:my-org/shop-api.git", "ref": "'"$SHA"'"}'
+```
+
+### Private repositories
+
+A deploy with `repository` runs `git:sync`, which clones as the `dokku` user on the server. For a private repository, that user needs read access. There are two ways:
+
+**SSH deploy key** (simplest for one repository):
+
+```sh
+dokku api:deploy-key my-org/shop-api
+```
+
+This creates `~dokku/.ssh/id_ed25519` (or reuses it), adds GitHub's pinned host key to `~dokku/.ssh/known_hosts`, and prints the public key with the link to add it under the repository's Settings → Deploy keys (read-only). Then deploy with `git@github.com:my-org/shop-api.git`. **GitHub accepts a deploy key for one repository only**, so this covers one private repository per server.
+
+**HTTPS with a token** (for several repositories): create a fine-grained personal access token (or one for a machine user) with read-only "Contents" access to the repositories, then:
+
+```sh
+dokku git:auth github.com <github-user> <token>
+```
+
+Then deploy with `https://github.com/my-org/shop-api.git`. The token is stored by Dokku in `~dokku/.netrc`.
 
 ## CLI bridge
 
@@ -450,6 +507,20 @@ jobs:
           scale: web=2 worker=1
 ```
 
+Building from source on the server instead, with Dokku's builder, one retry and a short log:
+
+```yaml
+      - uses: tiny-tools/dokku-rest-api@v1
+        with:
+          dokku_url: https://api.dokku.example.com
+          app_name: shop-api
+          deploy_repository: git@github.com:${{ github.repository }}.git   # see "Private repositories"
+          deploy_ref: ${{ github.sha }}
+          deploy_retries: 1
+```
+
+No checkout step is needed: the server fetches the commit itself.
+
 ### Inputs
 
 | Input               | Default | Description |
@@ -545,6 +616,10 @@ Settings stored in the database are changed with `dokku api:set <key> [<value>]`
 | `403 Missing scope` | `dokku api:perm-list <token>` |
 | `403 Argument not permitted` | compare the argument with the regex in `dokku api:allowlist-list` |
 | Deploys time out in the client | raise the client timeout; the server allows up to `DOKKU_API_EXEC_TIMEOUT_MS` |
+| Deploy fails with `Permission denied (publickey)` | the `dokku` user has no access to the repository: [Private repositories](#private-repositories) |
+| Deploy fails with `Host key verification failed` | `github.com` is missing from `~dokku/.ssh/known_hosts`; `dokku api:deploy-key` adds it |
+| `api:setup --letsencrypt`: certbot failed | the domain must point to this server and port 80 must be reachable; certbot's log is `/var/log/letsencrypt/letsencrypt.log` |
+| `api:setup --letsencrypt`: `dokku-api-certbot is missing` or sudo asks for a password | the plugin was installed before 1.1; re-run `sudo dokku plugin:install` |
 
 ## Updating and uninstalling
 
@@ -564,7 +639,7 @@ sudo rm -rf /var/lib/dokku/data/api /etc/default/dokku-api   # optional: remove 
 npm install
 npm test           # builds dist/ and runs all tests against a fake dokku binary
 npm run typecheck
-shellcheck -x -e SC1091 install uninstall commands post-deploy bin/dokku-api subcommands/*
+shellcheck -x -e SC1091 install uninstall commands post-deploy bin/dokku-api bin/dokku-api-certbot subcommands/*
 ```
 
 Run the daemon locally against the fake binary:
@@ -583,8 +658,9 @@ DOKKU_API_DB=./dev.db DOKKU_API_DOKKU_BIN=$PWD/test/fake-dokku.mjs bin/dokku-api
 ├── install, uninstall    Dokku triggers (systemd unit, nginx include, data dir)
 ├── post-deploy           Dokku trigger → webhook
 ├── commands              `dokku help` / `dokku api:help`
-├── subcommands/          `dokku api:*` (thin wrappers; setup is bash)
+├── subcommands/          `dokku api:*` (thin wrappers; setup and deploy-key are bash)
 ├── bin/dokku-api         launcher for dist/{daemon,cli,webhook}.js
+├── bin/dokku-api-certbot root helper for api:setup --letsencrypt
 ├── src/
 │   ├── server.ts         HTTP server and REST routes
 │   ├── oidc.ts           GitHub Actions OIDC: token verification, trust matching
