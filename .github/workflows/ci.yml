@@ -18,7 +18,7 @@ jobs:
       - name: dist/ is up to date
         run: git diff --exit-code -- dist
       - name: shellcheck
-        run: shellcheck -x -e SC1091 install uninstall commands post-deploy bin/dokku-api bin/dokku-api-certbot subcommands/*
+        run: shellcheck -x -e SC1091 install uninstall update commands post-deploy bin/dokku-api bin/dokku-api-certbot subcommands/*
 
   # The action against the real daemon (with the fake dokku binary), signed in
   # with a real GitHub OIDC token: proves issuer, keys, claims and audience
@@ -52,6 +52,8 @@ jobs:
           app_name: shop-api
           deploy_repository: https://github.com/${{ github.repository }}.git
           deploy_ref: ${{ github.sha }}
+          health_check_url: http://127.0.0.1:5099/health
+          health_check_contains: '"status": "ok"'
       - name: A failing deploy is retried
         id: retried
         continue-on-error: true

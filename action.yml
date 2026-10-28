@@ -63,8 +63,20 @@ inputs:
       Allow-listed dokku commands, one JSON array per line, e.g. ["ps:scale", "web=2"].
       The app from app_name is inserted automatically. A JSON object line is sent as-is to POST /api/v1/cli.
     required: false
+  health_check_url:
+    description: >
+      Optional URL the app answers on (e.g. https://shop.example.com/health). After all other steps, the
+      action polls it until it returns 2xx. Leave it out for apps without a health endpoint.
+    required: false
+  health_check_contains:
+    description: Text the health check's response must contain, e.g. ${{ github.sha }} when the endpoint reports the version
+    required: false
+  health_check_timeout:
+    description: Seconds to wait for the app to become healthy
+    required: false
+    default: "120"
   timeout_seconds:
-    description: HTTP timeout per request
+    description: Timeout per API request in seconds; a synchronous deploy may take this long
     required: false
     default: "900"
 

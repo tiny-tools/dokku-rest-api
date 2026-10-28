@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Dokku trigger: runs as root after `dokku plugin:update` (for every plugin) and `dokku update`.
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+PLUGIN_DIR="$(dirname "$(readlink -f "$0")")"
+
+# `plugin:update api <tag>` runs git fetch and checkout with all output
+# discarded and reports success either way, e.g. when root cannot fetch a
+# private repository. Check what is actually checked out.
+fn-api-verify-checkout() {
+  local committish wanted head
+  [[ -f "$PLUGIN_DIR/.plugin_committish" ]] || return 0
+  committish="$(<"$PLUGIN_DIR/.plugin_committish")"
+  wanted="$(git -C "$PLUGIN_DIR" rev-parse --verify --quiet "$committish^{commit}" || true)"
+  head="$(git -C "$PLUGIN_DIR" rev-parse HEAD)"
+  [[ -n "$wanted" ]] && [[ "$wanted" == "$head" ]] && return 0
+
+  dokku_log_warn "api: $committish is not checked out; the plugin is still at $(git -C "$PLUGIN_DIR" describe --tags --always)"
+  dokku_log_warn "api: git fetch reports:"
+  GIT_TERMINAL_PROMPT=0 git -C "$PLUGIN_DIR" fetch --tags 2>&1 | sed 's/^/        /' || true
+  dokku_log_warn "api: if the repository is private, root needs read access to it (README: Updating and uninstalling)"
+  return 1
+}
+
+plugin-update() {
+  if ! fn-api-verify-checkout; then
+    dokku_log_warn "api: not updated; nothing was changed"
+    return 0
+  fi
+  # Same steps as a fresh install: migrate the database, install the certbot
+  # helper, restart the daemon with the new code.
+  "$PLUGIN_DIR/install"
+}
+
+plugin-update "$@"

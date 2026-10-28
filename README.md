@@ -521,6 +521,14 @@ Building from source on the server instead, with Dokku's builder, one retry and 
 
 No checkout step is needed: the server fetches the commit itself.
 
+To check the app itself after the deploy, add a health check. It is optional, because not every app has such an endpoint; Dokku's own [zero-downtime checks](https://dokku.com/docs/deployment/zero-downtime-deploys/) already run during the deploy.
+
+```yaml
+          health_check_url: https://shop.example.com/version
+          health_check_contains: ${{ github.sha }}   # the app reports GIT_REV, so the new release is really live
+          health_check_timeout: 180
+```
+
 ### Inputs
 
 | Input               | Default | Description |
@@ -540,7 +548,10 @@ No checkout step is needed: the server fetches the commit itself.
 | `scale`             |         | formation, e.g. `web=2 worker=1` |
 | `restart`           | `false` | restart the app |
 | `cli_commands`      |         | one JSON array per line, e.g. `["ps:scale", "web=2"]` (the app is added for you), or a full `/cli` request object |
-| `timeout_seconds`   | `900`   | HTTP timeout per request |
+| `health_check_url`  |         | URL of the app to poll after all other steps until it answers `2xx`; leave it out for apps without a health endpoint |
+| `health_check_contains` |     | text the response must contain, e.g. `${{ github.sha }}` when the endpoint reports the running version |
+| `health_check_timeout` | `120` | seconds to wait for a healthy answer (polled every 5 s) |
+| `timeout_seconds`   | `900`   | timeout per API request; a synchronous deploy may take this long (the action does not use `fetch`, so there is no hidden 5-minute limit) |
 
 Steps run in this order: config → deploy → scale → restart → cli_commands. If none of these inputs is set, the action just reports the app status.
 
@@ -624,14 +635,29 @@ Settings stored in the database are changed with `dokku api:set <key> [<value>]`
 ## Updating and uninstalling
 
 ```sh
-# Update to the latest main, then re-run the install hook (migrates the database and restarts the daemon)
-sudo dokku plugin:update api
-sudo dokku plugin:install
+# Update to a release (or leave out the tag for the latest main)
+sudo dokku plugin:update api v1.2.0
+dokku api:report        # "Plugin version" shows what is installed
 
 # Uninstall: removes the service and nginx config, keeps the database
 sudo dokku plugin:uninstall api
 sudo rm -rf /var/lib/dokku/data/api /etc/default/dokku-api   # optional: remove all data
 ```
+
+After the code is updated, the plugin's `update` trigger migrates the database, refreshes the certbot helper and restarts the daemon; no `plugin:install` is needed afterwards. Dokku runs the trigger from the newly checked-out code, so this already applies to the update to 1.2.0.
+
+**The update is checked.** Dokku's `plugin:update` discards git's output and reports "updated and pinned" even when the fetch failed. The `update` trigger compares what is checked out with the requested tag, and if they differ, it prints git's actual error and changes nothing.
+
+**Private copy of this repository:** git runs as root on the server, so root needs read access, for example with a read-only deploy key:
+
+```sh
+sudo ssh-keygen -t ed25519 -N '' -f /root/.ssh/id_ed25519   # unless root has a key already
+sudo cat /root/.ssh/id_ed25519.pub   # add it under the repository's Settings → Deploy keys
+echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' | sudo tee -a /root/.ssh/known_hosts
+sudo git -C /var/lib/dokku/plugins/available/api remote set-url origin git@github.com:<owner>/dokku-rest-api.git
+```
+
+Install a private copy with `sudo dokku plugin:install git@github.com:<owner>/dokku-rest-api.git --name api` after the same key setup.
 
 ## Development
 
