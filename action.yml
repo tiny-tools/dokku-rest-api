@@ -69,7 +69,7 @@ inputs:
       action polls it until it returns 2xx. Leave it out for apps without a health endpoint.
     required: false
   health_check_contains:
-    description: Text the health check's response must contain, e.g. ${{ github.sha }} when the endpoint reports the version
+    description: Text the health check's response must contain, e.g. the commit SHA (github.sha) when the endpoint reports the version
     required: false
   health_check_timeout:
     description: Seconds to wait for the app to become healthy
