@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+# GitHub's ed25519 host key (fingerprint SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU),
+# pinned instead of trusting whatever ssh-keyscan returns.
+GITHUB_HOST_KEY="github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+
+cmd-api-deploy-key() {
+  # shellcheck disable=SC2034
+  declare desc="creates the SSH key git:sync uses to clone private GitHub repositories"
+  [[ "$1" == "api:deploy-key" ]] && shift 1
+  local REPOSITORY="$1"
+  if [[ -n "$REPOSITORY" ]] && [[ ! "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    dokku_log_fail "Usage: dokku api:deploy-key [<owner>/<repo>]"
+  fi
+
+  # git:sync runs git as the dokku user, which uses this key and known_hosts.
+  local SSH_DIR="${DOKKU_ROOT:-/home/dokku}/.ssh"
+  local KEY="$SSH_DIR/id_ed25519"
+  mkdir -p "$SSH_DIR"
+  chmod 700 "$SSH_DIR"
+
+  if [[ -f "$KEY" ]]; then
+    dokku_log_info1 "Using the existing key $KEY"
+  else
+    ssh-keygen -q -t ed25519 -N "" -C "dokku@$(hostname)" -f "$KEY"
+    dokku_log_info1 "Created $KEY"
+  fi
+
+  if ! ssh-keygen -F github.com -f "$SSH_DIR/known_hosts" >/dev/null 2>&1; then
+    echo "$GITHUB_HOST_KEY" >>"$SSH_DIR/known_hosts"
+    chmod 644 "$SSH_DIR/known_hosts"
+    dokku_log_info1 "Added github.com to $SSH_DIR/known_hosts"
+  fi
+
+  dokku_log_info2 "Add this public key as a read-only deploy key:"
+  if [[ -n "$REPOSITORY" ]]; then
+    dokku_log_info2 "  https://github.com/$REPOSITORY/settings/keys/new"
+  else
+    dokku_log_info2 "  https://github.com/<owner>/<repo>/settings/keys/new"
+  fi
+  echo
+  cat "$KEY.pub"
+  echo
+  dokku_log_info2 "Then deploy with repository git@github.com:<owner>/<repo>.git"
+  dokku_log_warn "GitHub accepts a deploy key for one repository only. For several private repositories"
+  dokku_log_warn "on this server, use HTTPS with a fine-grained token instead: dokku git:auth github.com <user> <token>"
+}
+
+cmd-api-deploy-key "$@"

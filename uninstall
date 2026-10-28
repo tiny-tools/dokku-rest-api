@@ -14,10 +14,12 @@ plugin-uninstall() {
     systemctl daemon-reload
   fi
   rm -f /etc/nginx/conf.d/dokku-api.conf /var/lib/dokku/data/api/nginx/*.conf
+  rm -f /etc/sudoers.d/dokku-api /usr/local/sbin/dokku-api-certbot
   if command -v nginx >/dev/null && nginx -t >/dev/null 2>&1; then
     systemctl reload nginx 2>/dev/null || true
   fi
-  dokku_log_info1 "Removed dokku-api service and nginx config; data kept in /var/lib/dokku/data/api"
+  dokku_log_info1 "Removed dokku-api service, nginx config and certbot helper; data kept in /var/lib/dokku/data/api"
+  dokku_log_info2 "A Let's Encrypt certificate from api:setup stays in /etc/letsencrypt (sudo certbot delete --cert-name <domain>)"
 }
 
 plugin-uninstall "$@"

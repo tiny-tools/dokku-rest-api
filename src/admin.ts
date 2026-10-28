@@ -14,10 +14,12 @@ export const HELP = `Usage: dokku api[:COMMAND]
 Manage the Dokku REST API
 
 Additional commands:
-    api:setup [--domain <domain>] [--ssl-cert <path> --ssl-key <path>]  Expose the API through nginx
+    api:setup --domain <domain> [--letsencrypt [--email <email>] [--delete-old-cert] | --ssl-cert <path> --ssl-key <path>]
+                                                                       Expose the API through nginx, with TLS
+    api:deploy-key [<owner>/<repo>]                                    Create the SSH key git:sync uses for private GitHub repositories
     api:report                                                         Show daemon, database and settings status
-    api:token-create <name> [--app <pattern> --scope <scopes>]... [--expires-in <30d|12h>]
-                                                                       Create a token (printed once)
+    api:token-create <name> [--app <pattern> --scope <scopes>]... [--expires-in <30d|12h>] [--quiet | --format json]
+                                                                       Create a token (printed once; --quiet prints only the token)
     api:token-list                                                     List tokens
     api:token-revoke <name>                                            Revoke a token immediately
     api:trust-github <owner/repo> [--app <pattern> --scope <scopes>]... [--environment <env>]
@@ -182,15 +184,29 @@ export async function run(argv: string[], store: Store, out: (s: string) => void
         scope: { type: "string", multiple: true },
         "expires-in": { type: "string" },
         "expires-at": { type: "string" },
+        quiet: { type: "boolean" },
+        format: { type: "string" },
       });
       const name = positionals[0];
       if (!name || !NAME_RE.test(name)) throw new UsageError("missing or invalid token name");
+      if (values.format !== undefined && values.format !== "json") throw new UsageError('--format only supports "json"');
+      if (values.quiet && values.format) throw new UsageError("give either --quiet or --format json");
       if (store.getTokenByName(name)) throw new UsageError(`token "${name}" already exists`);
       const pairs = grants((values.app as string[]) ?? [], (values.scope as string[]) ?? []);
       pairs.forEach(([, s]) => expandScopes(s));
       const expiresAt = expiry(values);
       const { token, row } = store.createToken(name, expiresAt);
       for (const [app, scopes] of pairs) for (const s of expandScopes(scopes)) store.addPermission(row.id, app, s);
+      // Machine-readable output, e.g. to pipe the token into a secret store.
+      if (values.quiet) {
+        out(token);
+        return;
+      }
+      if (values.format === "json") {
+        const permissions = store.listPermissions(row.id).map((p) => ({ app_pattern: p.app_pattern, scope: p.scope }));
+        out(JSON.stringify({ name, token, expires_at: expiresAt, permissions }));
+        return;
+      }
       out(`=====> Created token "${name}"${expiresAt ? ` (expires ${expiresAt})` : ""}`);
       out(`       Store it now, it will not be shown again:`);
       out("");

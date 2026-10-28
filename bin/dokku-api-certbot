@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Root helper for `dokku api:setup --letsencrypt`. The install trigger copies it
+# to /usr/local/sbin (root-owned) and lets the dokku user run it via sudo, so
+# it accepts nothing but these two forms:
+#   dokku-api-certbot issue <domain> [<email>]   obtain (or keep) a certificate via the API's webroot
+#   dokku-api-certbot delete <domain>            delete a certificate this helper obtained
+set -eo pipefail
+
+ACME_DIR="/var/lib/dokku/data/api/acme"
+DOMAIN_RE='^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'
+EMAIL_RE='^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'
+
+fail() {
+  echo " !     $*" >&2
+  exit 1
+}
+
+ACTION="$1"
+DOMAIN="$2"
+[[ "$DOMAIN" =~ $DOMAIN_RE ]] || fail "invalid domain: $DOMAIN"
+command -v certbot >/dev/null || fail "certbot is not installed (e.g. apt install certbot)"
+
+case "$ACTION" in
+  issue)
+    [[ $# -le 3 ]] || fail "usage: dokku-api-certbot issue <domain> [<email>]"
+    CONTACT=(--register-unsafely-without-email)
+    if [[ -n "$3" ]]; then
+      [[ "$3" =~ $EMAIL_RE ]] || fail "invalid email: $3"
+      CONTACT=(--email "$3")
+    fi
+    certbot certonly --non-interactive --agree-tos --keep-until-expiring \
+      --webroot -w "$ACME_DIR" -d "$DOMAIN" --cert-name "$DOMAIN" "${CONTACT[@]}" \
+      --deploy-hook "systemctl reload nginx"
+    ;;
+  delete)
+    [[ $# -eq 2 ]] || fail "usage: dokku-api-certbot delete <domain>"
+    CONF="/etc/letsencrypt/renewal/$DOMAIN.conf"
+    if [[ ! -f "$CONF" ]]; then
+      echo "No certificate for $DOMAIN"
+      exit 0
+    fi
+    # Never touch certificates that something else obtained.
+    grep -qF "$ACME_DIR" "$CONF" || fail "the certificate for $DOMAIN was not obtained through the API's webroot; not deleting it"
+    certbot delete --non-interactive --cert-name "$DOMAIN"
+    ;;
+  *)
+    fail "usage: dokku-api-certbot issue <domain> [<email>] | delete <domain>"
+    ;;
+esac

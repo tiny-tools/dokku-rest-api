@@ -20,7 +20,7 @@ npm install
 npm test             # tsc build + node:test (test/*.test.mjs) against test/fake-dokku.mjs
 npm run typecheck
 npm run build        # required before committing: dist/ is checked in
-shellcheck -x -e SC1091 install uninstall commands post-deploy bin/dokku-api subcommands/*
+shellcheck -x -e SC1091 install uninstall commands post-deploy bin/dokku-api bin/dokku-api-certbot subcommands/*
 ```
 
 CI (`.github/workflows/ci.yml`) runs the tests, fails if `dist/` differs from a fresh build, and runs shellcheck.
@@ -54,6 +54,7 @@ CI (`.github/workflows/ci.yml`) runs the tests, fails if `dist/` differs from a 
 
 - `install` and `uninstall` run as **root** (`plugin:*` commands keep root). Subcommands and `post-deploy` run as the **`dokku` user** (Dokku re-execs itself via sudo), so they cannot touch systemd or write outside `/var/lib/dokku/data/api`.
 - For that reason, `api:setup` writes nginx config to `/var/lib/dokku/data/api/nginx/`, which `install` includes from `/etc/nginx/conf.d/dokku-api.conf`. It reloads nginx only through the commands Dokku's sudoers already allows (`nginx -t`, `systemctl reload nginx`).
+- `api:setup --letsencrypt` needs root for certbot. `install` copies `bin/dokku-api-certbot` to `/usr/local/sbin` (root-owned, so the dokku user cannot change it) and allows exactly that file in `/etc/sudoers.d/dokku-api`. The helper validates every argument itself and only deletes certificates obtained through the API's webroot. Keep it that narrow.
 - `uninstall` receives the plugin name as `$1` and is called for every plugin uninstall, so it must check that the name is its own.
 - Subcommand wrappers derive the command name from their file name. To add a new `api:<cmd>`, copy one of them, add a `case` in `run()` in `src/admin.ts`, and list it in `HELP`.
 - Reference: Dokku's own source (`plugins/*/subcommands`, `plugins/common/functions`) is the best documentation for argument parsing and conventions.

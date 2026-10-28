@@ -6,7 +6,7 @@ import { HttpError, isPlainObject, parseBool, readJsonBody, sendJson, sendProble
 import { authenticateGithub, AuthError, looksLikeJwt } from "./oidc.js";
 import { APP_NAME_RE, globMatch, type Scope } from "./scopes.js";
 
-export const VERSION = "1.0.0";
+export const VERSION = "1.1.0";
 
 interface Ctx {
   req: IncomingMessage;
@@ -15,6 +15,8 @@ interface Ctx {
   params: Record<string, string>;
   token: TokenRow;
   store: Store;
+  // `?log_tail=N`: return only the last N lines of a command's output.
+  logTail: number | undefined;
   // Filled by handlers for the audit log.
   audit: { app: string | null; command: string | null; exit_code: number | null };
 }
@@ -42,17 +44,36 @@ async function exec(ctx: Ctx, argv: string[], opts: { timeoutMs?: number; redact
   return result;
 }
 
+type Execution = ExecResult & { truncated?: boolean };
+
+function lastLines(text: string, n: number): { text: string; cut: boolean } {
+  const trailing = text.endsWith("\n");
+  const lines = (trailing ? text.slice(0, -1) : text).split("\n");
+  if (text === "" || lines.length <= n) return { text, cut: false };
+  return { text: lines.slice(lines.length - n).join("\n") + (trailing && n > 0 ? "\n" : ""), cut: true };
+}
+
+// A command result as returned to the client: the same fields everywhere,
+// with stdout/stderr shortened when the request asked for `?log_tail=N`.
+function present(ctx: Ctx, result: ExecResult): Execution {
+  if (ctx.logTail === undefined) return result;
+  const stdout = lastLines(result.stdout, ctx.logTail);
+  const stderr = lastLines(result.stderr, ctx.logTail);
+  return { ...result, stdout: stdout.text, stderr: stderr.text, truncated: stdout.cut || stderr.cut };
+}
+
 // Maps a failed dokku invocation to an HTTP error.
-function failure(result: ExecResult): HttpError {
+function failure(ctx: Ctx, result: ExecResult): HttpError {
   const output = `${result.stderr}\n${result.stdout}`;
-  if (result.timed_out) return new HttpError(504, "Command timed out", "the dokku command did not finish in time", result as unknown as Record<string, unknown>);
+  const shown = present(ctx, result) as unknown as Record<string, unknown>;
+  if (result.timed_out) return new HttpError(504, "Command timed out", "the dokku command did not finish in time", shown);
   if (/does not exist/i.test(output)) return new HttpError(404, "Not Found", output.trim().split("\n").pop()?.replace(/^[\s!>-]+/, ""));
-  return new HttpError(422, "Command failed", `dokku exited with code ${result.exit_code}`, { ...result });
+  return new HttpError(422, "Command failed", `dokku exited with code ${result.exit_code}`, shown);
 }
 
 async function execOrThrow(ctx: Ctx, argv: string[], opts?: { timeoutMs?: number; redact?: boolean }): Promise<ExecResult> {
   const result = await exec(ctx, argv, opts);
-  if (!result.ok) throw failure(result);
+  if (!result.ok) throw failure(ctx, result);
   return result;
 }
 
@@ -121,8 +142,8 @@ async function runCli(ctx: Ctx, request: CliRequest): Promise<{ status: number; 
   ctx.audit.app = typeof request.app === "string" ? request.app : null;
   if (!decision.ok) throw new HttpError(decision.status, decision.title, decision.detail);
   const result = await exec(ctx, decision.argv);
-  if (result.timed_out) throw failure(result);
-  return { status: result.ok ? 200 : 422, body: result };
+  if (result.timed_out) throw failure(ctx, result);
+  return { status: result.ok ? 200 : 422, body: present(ctx, result) };
 }
 
 // --- routes ----------------------------------------------------------------
@@ -243,8 +264,9 @@ const routes: Route[] = [
       });
       if (tuples.length === 0) throw new HttpError(400, "Invalid body", 'expected e.g. {"web": 2, "worker": 1}');
       const skipDeploy = parseBool(ctx.url.searchParams.get("skip_deploy"), false);
-      const result = await execOrThrow(ctx, ["ps:scale", ...(skipDeploy ? ["--skip-deploy"] : []), name, ...tuples]);
-      return { name, formation: await formation(ctx, name), execution: result };
+      const result = present(ctx, await execOrThrow(ctx, ["ps:scale", ...(skipDeploy ? ["--skip-deploy"] : []), name, ...tuples]));
+      // `execution` duplicates the top-level fields for clients of 1.0; it goes away in 2.0.
+      return { name, formation: await formation(ctx, name), ...result, execution: result };
     },
   },
   {
@@ -267,7 +289,7 @@ const routes: Route[] = [
       if (!CONFIG_KEY_RE.test(key)) throw new HttpError(400, "Invalid key", `"${key}" is not a valid variable name`);
       const result = await exec(ctx, ["config:get", name, key]);
       if (!result.ok) {
-        if (/does not exist/i.test(result.stderr + result.stdout)) throw failure(result);
+        if (/does not exist/i.test(result.stderr + result.stdout)) throw failure(ctx, result);
         throw new HttpError(404, "Not Found", `config var "${key}" is not set`);
       }
       return { key, value: result.stdout.replace(/\n$/, "") };
@@ -319,7 +341,7 @@ const routes: Route[] = [
         if (proc !== undefined && (action !== "restart" || typeof proc !== "string" || !PROCESS_RE.test(proc))) {
           throw new HttpError(400, "Invalid body", '"process" is only supported for restart and must be a process type');
         }
-        return execOrThrow(ctx, [`ps:${action}`, name, ...(proc ? [proc as string] : [])]);
+        return present(ctx, await execOrThrow(ctx, [`ps:${action}`, name, ...(proc ? [proc as string] : [])]));
       },
     }),
   ),
@@ -345,7 +367,7 @@ const routes: Route[] = [
       } else {
         argv = ["ps:rebuild", name];
       }
-      return execOrThrow(ctx, argv);
+      return present(ctx, await execOrThrow(ctx, argv));
     },
   },
   {
@@ -383,10 +405,12 @@ async function setConfig(ctx: Ctx, vars: Record<string, unknown>): Promise<unkno
     return `${key}=${Buffer.from(String(value), "utf8").toString("base64")}`;
   });
   const restart = parseBool(ctx.url.searchParams.get("restart"), true);
-  const result = await execOrThrow(ctx, ["config:set", "--encoded", ...(restart ? [] : ["--no-restart"]), name, ...pairs], {
-    redact: true,
-  });
-  return { name, keys: entries.map(([k]) => k), restarted: restart, execution: result };
+  const result = present(
+    ctx,
+    await execOrThrow(ctx, ["config:set", "--encoded", ...(restart ? [] : ["--no-restart"]), name, ...pairs], { redact: true }),
+  );
+  // `execution` duplicates the top-level fields for clients of 1.0; it goes away in 2.0.
+  return { name, keys: entries.map(([k]) => k), restarted: restart, ...result, execution: result };
 }
 
 // --- server ----------------------------------------------------------------
@@ -461,7 +485,13 @@ export function createApiServer(store: Store): Server {
         throw new HttpError(403, "Forbidden", `token lacks scope "${hit.route.scope}" for ${params.app ? `app "${params.app}"` : "all apps"}`);
       }
 
-      const ctx: Ctx = { req, res, url, params, token, store, audit };
+      const tailParam = url.searchParams.get("log_tail");
+      const logTail = tailParam === null ? undefined : Number(tailParam);
+      if (logTail !== undefined && (!Number.isInteger(logTail) || logTail < 0 || logTail > 100000)) {
+        throw new HttpError(400, "Invalid query parameter", '"log_tail" must be an integer between 0 and 100000');
+      }
+
+      const ctx: Ctx = { req, res, url, params, token, store, logTail, audit };
       res.statusCode = 200;
       const result = await hit.route.handler(ctx);
       sendJson(res, res.statusCode, result);
