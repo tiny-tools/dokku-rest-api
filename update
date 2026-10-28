@@ -20,7 +20,7 @@ fn-api-verify-checkout() {
   dokku_log_warn "api: $committish is not checked out; the plugin is still at $(git -C "$PLUGIN_DIR" describe --tags --always)"
   dokku_log_warn "api: git fetch reports:"
   GIT_TERMINAL_PROMPT=0 git -C "$PLUGIN_DIR" fetch --tags 2>&1 | sed 's/^/        /' || true
-  dokku_log_warn "api: if the repository is private, root needs read access to it (README: Updating and uninstalling)"
+  dokku_log_warn "api: if the repository is private, root needs read access to it (README: Troubleshooting, 'Running from a private copy')"
   return 1
 }
 

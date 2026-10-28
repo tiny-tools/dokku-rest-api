@@ -2,7 +2,35 @@
 
 **Deploy to Dokku from GitHub Actions without SSH keys and without secrets.**
 
-`dokku-rest-api` is a Dokku plugin. It runs a small HTTP daemon on your Dokku host and gives you:
+```yaml
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      id-token: write          # the job proves who it is with a GitHub ID token
+    steps:
+      - uses: tiny-tools/dokku-rest-api@v1
+        with:
+          dokku_url: https://api.dokku.example.com
+          app_name: shop-api
+          deploy_repository: https://github.com/${{ github.repository }}.git
+          deploy_ref: ${{ github.sha }}
+```
+
+The action talks to the **dokku-rest-api plugin**, which you install once on your Dokku server, and you say once there which repository may deploy which app (see [Quick start](#quick-start)):
+
+```sh
+sudo dokku plugin:install https://github.com/tiny-tools/dokku-rest-api.git --name api
+dokku api:setup --domain api.dokku.example.com --letsencrypt
+dokku api:trust-github my-org/shop-api --environment production --app shop-api --scope deploy
+```
+
+> This is an independent project by [Tiny Tools](https://github.com/tiny-tools), not part of or endorsed by the [Dokku](https://dokku.com) project. For Dokku's own action, which deploys via `git push` over SSH, see [dokku/github-action](https://github.com/dokku/github-action).
+
+## What it is
+
+`dokku-rest-api` is a Dokku plugin plus a GitHub Action. The plugin runs a small HTTP daemon on your Dokku host and gives you:
 
 - **Secret-free deploys from GitHub Actions.** You tell the server once which repository may do what (`dokku api:trust-github`). The workflow proves who it is with an ID token from GitHub (OIDC). No repository needs an SSH key or a token stored in its secrets.
 - **A REST/JSON API** for day-to-day operations: app status, scaling, deploys, restarts, environment variables and logs.
@@ -11,7 +39,7 @@
 
 Every caller can be limited to specific apps (`shop-api`, `staging-*` or `*`) and to specific actions (read-only, deploy, config…).
 
-### Two ways to sign in
+## Two ways to sign in
 
 | | GitHub trust (OIDC) | API token |
 |---|---|---|
@@ -41,6 +69,8 @@ SQLite: /var/lib/dokku/data/api/storage.db
 
 ## Contents
 
+- [What it is](#what-it-is)
+- [Two ways to sign in](#two-ways-to-sign-in)
 - [Features](#features)
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
@@ -56,6 +86,7 @@ SQLite: /var/lib/dokku/data/api/storage.db
 - [Troubleshooting](#troubleshooting)
 - [Updating and uninstalling](#updating-and-uninstalling)
 - [Development](#development)
+- [License and security](#license-and-security)
 
 ## Features
 
@@ -557,8 +588,6 @@ Steps run in this order: config → deploy → scale → restart → cli_command
 
 To build from source on the server, use `deploy_repository` with `deploy_ref: ${{ github.sha }}`. Dokku then fetches the repository itself (`git:sync --build`). For a private repository, give the server read access once, for example with a fine-grained GitHub token that may only read contents: `dokku git:auth github.com <user> <token>`.
 
-**Using the action from a private copy of this repository:** in that repository, allow access under Settings → Actions → General → Access ("Accessible from repositories in the organization").
-
 ### Outputs
 
 | Output    | Description |
@@ -632,6 +661,23 @@ Settings stored in the database are changed with `dokku api:set <key> [<value>]`
 | `api:setup --letsencrypt`: certbot failed | the domain must point to this server and port 80 must be reachable; certbot's log is `/var/log/letsencrypt/letsencrypt.log` |
 | `api:setup --letsencrypt`: `dokku-api-certbot is missing` or sudo asks for a password | the plugin was installed before 1.1; re-run `sudo dokku plugin:install` |
 
+### Running from a private copy
+
+Only relevant if you run a **private copy** of this repository instead of the public one.
+
+**Plugin:** git runs as root on the server, so root needs read access, for example with a read-only deploy key:
+
+```sh
+sudo ssh-keygen -t ed25519 -N '' -f /root/.ssh/id_ed25519   # unless root has a key already
+sudo cat /root/.ssh/id_ed25519.pub   # add it under the repository's Settings → Deploy keys
+echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' | sudo tee -a /root/.ssh/known_hosts
+sudo git -C /var/lib/dokku/plugins/available/api remote set-url origin git@github.com:<owner>/dokku-rest-api.git
+```
+
+Install a private copy with `sudo dokku plugin:install git@github.com:<owner>/dokku-rest-api.git --name api` after the same key setup.
+
+**Action:** in the private repository, allow access under Settings → Actions → General → Access ("Accessible from repositories in the organization").
+
 ## Updating and uninstalling
 
 ```sh
@@ -647,17 +693,6 @@ sudo rm -rf /var/lib/dokku/data/api /etc/default/dokku-api   # optional: remove 
 After the code is updated, the plugin's `update` trigger migrates the database, refreshes the certbot helper and restarts the daemon; no `plugin:install` is needed afterwards. Dokku runs the trigger from the newly checked-out code, so this already applies to the update to 1.2.0.
 
 **The update is checked.** Dokku's `plugin:update` discards git's output and reports "updated and pinned" even when the fetch failed. The `update` trigger compares what is checked out with the requested tag, and if they differ, it prints git's actual error and changes nothing.
-
-**Private copy of this repository:** git runs as root on the server, so root needs read access, for example with a read-only deploy key:
-
-```sh
-sudo ssh-keygen -t ed25519 -N '' -f /root/.ssh/id_ed25519   # unless root has a key already
-sudo cat /root/.ssh/id_ed25519.pub   # add it under the repository's Settings → Deploy keys
-echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' | sudo tee -a /root/.ssh/known_hosts
-sudo git -C /var/lib/dokku/plugins/available/api remote set-url origin git@github.com:<owner>/dokku-rest-api.git
-```
-
-Install a private copy with `sudo dokku plugin:install git@github.com:<owner>/dokku-rest-api.git --name api` after the same key setup.
 
 ## Development
 
@@ -700,3 +735,7 @@ DOKKU_API_DB=./dev.db DOKKU_API_DOKKU_BIN=$PWD/test/fake-dokku.mjs bin/dokku-api
 ├── dist/                 compiled output (committed)
 └── test/                 node:test suites and the fake dokku binary
 ```
+
+## License and security
+
+MIT, see [LICENSE](LICENSE). Changes per version: [CHANGELOG.md](CHANGELOG.md). Please report security issues privately to **team@tinytools.io**, see [SECURITY.md](SECURITY.md).

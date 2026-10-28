@@ -6,7 +6,7 @@ import { HttpError, isPlainObject, parseBool, readJsonBody, sendJson, sendProble
 import { authenticateGithub, AuthError, looksLikeJwt } from "./oidc.js";
 import { APP_NAME_RE, globMatch, type Scope } from "./scopes.js";
 
-export const VERSION = "1.2.0";
+export const VERSION = "1.2.1";
 
 interface Ctx {
   req: IncomingMessage;
